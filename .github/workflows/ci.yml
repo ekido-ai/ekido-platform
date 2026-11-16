@@ -29,7 +29,6 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-          cache: pip
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -65,7 +64,6 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-          cache: pip
       - name: Install dependencies
         run: pip install "sqlalchemy>=2" "fastapi>=0.115" pydantic-settings eth-account web3 "alembic==1.20.1" "psycopg[binary]==3.3.6" "ekido-core @ git+https://github.com/ekido-ai/Ekido@v0.4.0#subdirectory=packages/ekido_core"
       - name: This service's own user and schema, as ekido-infra's postgres.sh sets up
