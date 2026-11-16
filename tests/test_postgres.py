@@ -65,7 +65,8 @@ class OnPostgres(unittest.TestCase):
 
     def test_the_coordinators_tables_are_out_of_reach(self):
         # Separate users per service: Postgres itself refuses, so no code path can read another service's data.
-        with self.connection.begin_nested(), self.assertRaises(ProgrammingError) as refused:
+        # The savepoint must be inside assertRaises, so it rolls back the failed statement before the check ends.
+        with self.assertRaises(ProgrammingError) as refused, self.connection.begin_nested():
             self.connection.execute(text("select count(*) from coordinator.jobs"))
         self.assertIn("permission denied", str(refused.exception).lower())
 
