@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: platform
+            dir: .
+            path: "."
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "sqlalchemy>=2" "fastapi>=0.115" httpx pydantic-settings websockets "uvicorn>=0.30" eth-account web3 "pyyaml==6.0.2" "ekido-core @ git+https://github.com/ekido-ai/Ekido@v0.4.0#subdirectory=packages/ekido_core"
+      - name: Run tests
+        working-directory: ${{ matrix.dir }}
+        env:
+          PYTHONPATH: ${{ matrix.path }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests
+
+  postgres:
+    name: Postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only-admin
+          POSTGRES_DB: ekido
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PGPASSWORD: ci-only-admin
+      SERVICE_URL: postgresql+psycopg://ekido_platform:ci-platform@127.0.0.1:5432/ekido?options=-csearch_path%3Dplatform
+      PYTHONPATH: "."
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install "sqlalchemy>=2" "fastapi>=0.115" pydantic-settings eth-account web3 "alembic==1.20.1" "psycopg[binary]==3.3.6" "ekido-core @ git+https://github.com/ekido-ai/Ekido@v0.4.0#subdirectory=packages/ekido_core"
+      - name: This service's own user and schema, as ekido-infra's postgres.sh sets up
+        run: |
+          psql -h 127.0.0.1 -U postgres -d ekido -v ON_ERROR_STOP=1 <<'SQL'
+          REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+          CREATE ROLE ekido_platform LOGIN PASSWORD 'ci-platform';
+          CREATE SCHEMA platform AUTHORIZATION ekido_platform;
+          ALTER ROLE ekido_platform IN DATABASE ekido SET search_path = platform;
+          REVOKE ALL ON SCHEMA platform FROM PUBLIC;
+          -- A stand-in for the coordinator's schema, so the isolation test has something to be refused.
+          CREATE ROLE ekido_coordinator LOGIN PASSWORD 'ci-coordinator';
+          CREATE SCHEMA coordinator AUTHORIZATION ekido_coordinator;
+          REVOKE ALL ON SCHEMA coordinator FROM PUBLIC;
+          CREATE TABLE coordinator.jobs (id text PRIMARY KEY);
+          ALTER TABLE coordinator.jobs OWNER TO ekido_coordinator;
+          SQL
+      - name: Migrations, the model check and the write paths
+        run: |
+          DATABASE_URL="$SERVICE_URL" python -m alembic -c alembic/alembic.ini upgrade head
+          DATABASE_URL="$SERVICE_URL" python -m alembic -c alembic/alembic.ini check
+          TEST_DATABASE_URL="$SERVICE_URL" python -m unittest -v tests.test_postgres
+          DATABASE_URL="$SERVICE_URL" python -m alembic -c alembic/alembic.ini downgrade base
