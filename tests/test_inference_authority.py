@@ -92,6 +92,16 @@ class InferenceAuthority(unittest.TestCase):
         result = TestClient(app).post('/internal/inference/reserve', json={'api_key': self.key, 'model_id': 'model1'})
         self.assertEqual(result.status_code, 503)
 
+    def test_readiness_requires_internal_token_and_a_valid_owned_model(self):
+        url = '/internal/inference/ready'
+        self.assertEqual(self.client.get(url).status_code, 401)
+        ready = self.client.get(url, headers=self.headers)
+        self.assertEqual(ready.status_code, 200)
+        self.assertEqual(ready.json()['engines'], ['http://127.0.0.1:19081'])
+        self.manifest['job_id'] = 'missing'
+        self.write_manifest()
+        self.assertEqual(self.client.get(url, headers=self.headers).status_code, 503)
+
 
 @unittest.skipUnless(os.environ.get('TEST_DATABASE_URL', '').startswith('postgresql'), 'requires migrated Postgres')
 class PostgresRateLimit(unittest.TestCase):

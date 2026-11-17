@@ -14,6 +14,10 @@ HTTP origin on a numeric loopback address and a specified port. The directory
 must not be writable by customers. Only the operator can assign model ownership
 or an engine; these values must not come from request parameters.
 
+The internal `/internal/inference/ready` endpoint returns the loopback origins
+of configured, job-owned models to an authenticated router. The router probes
+engine health itself; merely having a manifest does not mean an engine is ready.
+
 The router sends the customer's key and model ID to `/internal/inference/reserve`
 with the internal token in `X-Ekido-Inference-Token`. The authority checks the
 key hash, revocation, `models.predict` scope and job ownership. It reserves one

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import itertools
 import json
 import re
 import uuid
@@ -71,6 +72,29 @@ def build_inference_authority(engine: Engine, model_root: str, internal_token: s
             raise AccountError("INFERENCE_UNAVAILABLE", "Inference is not configured.", 503)
         if not hmac.compare_digest(x_ekido_inference_token.encode('utf-8'), internal_token.encode('utf-8')):
             raise AccountError("UNAUTHORIZED", "Invalid internal credential.", 401)
+
+    @router.get("/ready", dependencies=[Depends(internal)])
+    def ready() -> dict:
+        try:
+            files = list(itertools.islice(root.iterdir(), 257))
+        except OSError:
+            raise AccountError("INFERENCE_UNAVAILABLE", "Model registry is unavailable.", 503) from None
+        if len(files) > 256:
+            raise AccountError("INFERENCE_UNAVAILABLE", "Model registry exceeds the configured limit.", 503)
+        engines = set()
+        with Session(engine) as session:
+            for path in files:
+                if path.suffix != ".json":
+                    continue
+                try:
+                    item = model_manifest(root, path.stem)
+                except (ValueError, OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if session.get(JobOwner, item["job_id"]) is not None:
+                    engines.add(item["engine_url"])
+        if not engines:
+            raise AccountError("INFERENCE_UNAVAILABLE", "No models are configured.", 503)
+        return {"engines": sorted(engines)}
 
     @router.post("/reserve", dependencies=[Depends(internal)])
     def reserve(body: Reserve) -> dict:
