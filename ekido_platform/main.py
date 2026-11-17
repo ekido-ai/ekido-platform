@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     # The Coordinator, reached over localhost. Its operator token is only needed when the two run on different hosts.
     coordinator_url: str = "http://127.0.0.1:8003"
     coordinator_token: str = ""
+    # Operator-managed evidence and per-model manifests; empty disables savings reports.
+    savings_evidence_root: str = ""
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -66,6 +68,9 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     router, principal = build_router(engine, sender=sender, site_url=settings.site_url, allowed_origins=settings.cors_origins, cookie_secure=settings.session_cookie_secure)
     app.include_router(router)
     app.state.principal = principal
+
+    from .v1_savings import build_savings_router
+    app.include_router(build_savings_router(engine, principal, settings.savings_evidence_root))
 
     @app.exception_handler(AccountError)
     async def account_refused(_: Request, exc: AccountError):
