@@ -106,8 +106,8 @@ def build_inference_authority(engine: Engine, model_root: str, internal_token: s
     def finish(reservation_id: str, body: Finish) -> dict:
         if body.status == "ok" and (body.input_tokens is None or body.output_tokens is None):
             raise AccountError("INVALID_USAGE", "Successful requests require token counts.", 422)
-        if body.status == "error" and (body.input_tokens is not None or body.output_tokens is not None):
-            raise AccountError("INVALID_USAGE", "Failed requests cannot report completed token counts.", 422)
+        if (body.input_tokens is None) != (body.output_tokens is None):
+            raise AccountError("INVALID_USAGE", "Token counts must be supplied together.", 422)
         with Session(engine) as session, session.begin():
             usage = session.scalar(select(InferenceUsage).where(InferenceUsage.id == reservation_id).with_for_update())
             if usage is None:

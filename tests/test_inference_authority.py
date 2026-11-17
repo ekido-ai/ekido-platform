@@ -63,13 +63,17 @@ class InferenceAuthority(unittest.TestCase):
         self.assertEqual(first.status_code, 200, first.text)
         self.assertEqual(first.json()['engine_url'], self.manifest['engine_url'])
         reservation = first.json()['reservation_id']
-        self.assertEqual(self.reserve().status_code, 200)
+        second = self.reserve()
+        self.assertEqual(second.status_code, 200)
         self.assertEqual(self.reserve().status_code, 429)
         url = f'/internal/inference/usage/{reservation}'
         self.assertEqual(self.client.post(url, headers=self.headers, json={'status': 'ok', 'latency_ms': 4}).status_code, 422)
         usage = {'status': 'ok', 'latency_ms': 20, 'input_tokens': 3, 'output_tokens': 2}
         self.assertEqual(self.client.post(url, headers=self.headers, json=usage).status_code, 200)
         self.assertEqual(self.client.post(url, headers=self.headers, json=usage).status_code, 409)
+        partial = {'status': 'error', 'latency_ms': 30, 'input_tokens': 4, 'output_tokens': 1}
+        second_url = f"/internal/inference/usage/{second.json()['reservation_id']}"
+        self.assertEqual(self.client.post(second_url, headers=self.headers, json=partial).status_code, 200)
         with Session(self.app.state.engine) as session:
             row = session.get(InferenceUsage, reservation)
             self.assertEqual((row.status, row.input_tokens, row.output_tokens), ('ok', 3, 2))
