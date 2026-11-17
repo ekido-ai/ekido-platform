@@ -152,6 +152,7 @@ def build_assistant_router(engine: Engine, principal: Callable, engine_url: str,
         except AssistantError:
             raise AccountError('INVALID_DATASET', 'Dataset does not match this recipe or has invalid metadata.', 422) from None
         return {'conversation_id': conversation_id, 'reply': REPLIES[state['language']]['preview'],
-                'proposal': proposal, 'job_spec': spec, 'policy_status': 'model_screened_needs_review'}
+                'proposal': proposal, 'job_spec': spec, 'language': state['language'],
+                'policy_status': 'model_screened_needs_review'}
 
     return router

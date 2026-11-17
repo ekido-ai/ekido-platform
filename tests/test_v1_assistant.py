@@ -62,6 +62,7 @@ class AssistantRoute(unittest.TestCase):
         self.assertEqual(spec_problems(result['job_spec']), [])
         self.assertEqual(result['job_spec']['dataset']['sha256'], 'a' * 64)
         self.assertEqual(result['policy_status'], 'model_screened_needs_review')
+        self.assertEqual(result['language'], 'hinglish')
         self.assertEqual(len(self.calls), 4)
 
     def test_refusal_and_review_never_generate_a_proposal(self):
