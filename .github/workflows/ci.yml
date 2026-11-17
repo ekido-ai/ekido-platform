@@ -32,7 +32,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "sqlalchemy>=2" "fastapi>=0.115" httpx pydantic-settings websockets "uvicorn>=0.30" eth-account web3 "pyyaml==6.0.2" "ekido-core @ git+https://github.com/ekido-ai/ekido-core@v0.4.0#subdirectory=packages/ekido_core"
+          pip install "sqlalchemy>=2" "fastapi>=0.115" httpx pydantic-settings websockets "uvicorn>=0.30" eth-account web3 "pyyaml==6.0.2" "ekido-core @ git+https://github.com/ekido-ai/ekido-core@v0.4.1#subdirectory=packages/ekido_core"
       - name: Run tests
         working-directory: ${{ matrix.dir }}
         env:
@@ -65,7 +65,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install "sqlalchemy>=2" "fastapi>=0.115" httpx pydantic-settings eth-account web3 "alembic==1.20.1" "psycopg[binary]==3.3.6" "ekido-core @ git+https://github.com/ekido-ai/ekido-core@v0.4.0#subdirectory=packages/ekido_core"
+        run: pip install "sqlalchemy>=2" "fastapi>=0.115" httpx pydantic-settings eth-account web3 "alembic==1.20.1" "psycopg[binary]==3.3.6" "ekido-core @ git+https://github.com/ekido-ai/ekido-core@v0.4.1#subdirectory=packages/ekido_core"
       - name: This service's own user and schema, as ekido-infra's postgres.sh sets up
         run: |
           psql -h 127.0.0.1 -U postgres -d ekido -v ON_ERROR_STOP=1 <<'SQL'

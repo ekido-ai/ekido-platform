@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     inference_models_root: str = ""
     inference_internal_token: str = ""
     inference_rate_per_minute: int = 60
+    # Operator-managed evidence and per-model manifests; empty disables savings reports.
+    savings_evidence_root: str = ""
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -73,6 +75,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     from .v1_inference_authority import build_inference_authority
     app.include_router(build_inference_authority(engine, settings.inference_models_root,
                                                   settings.inference_internal_token, settings.inference_rate_per_minute))
+    from .v1_savings import build_savings_router
+    app.include_router(build_savings_router(engine, principal, settings.savings_evidence_root))
 
     @app.exception_handler(AccountError)
     async def account_refused(_: Request, exc: AccountError):
