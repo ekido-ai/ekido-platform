@@ -1,10 +1,20 @@
 # Savings calculation evidence
 
 `ekido_platform.savings.build_savings_report` calculates a report from four JSON
-files supplied by a trusted, customer-authorised artifact store. It is a standalone
-calculation and is not yet connected to the public savings-report endpoint. Do not
-accept arbitrary customer-selected filesystem paths or publish a savings claim until
-the artifacts have been authenticated and tied to the customer and job.
+files supplied by a trusted, customer-authorised artifact store. The platform can
+serve these through the authenticated savings-report endpoint when the operator
+configures `SAVINGS_EVIDENCE_ROOT`. Leave it unset to disable the endpoint.
+
+The root is a trusted operator-managed directory, never a customer-writable upload
+directory. Place an operator-verified manifest in `models/<model_id>.json`, with
+`job_id`, `expected_requests`, `api_run_file`, `model_run_file`, `quote_file` and
+`price_file`, and optional boolean `self_hosted`. File fields are paths relative to
+the root. The platform checks the manifest job against its existing `job_owners`
+record, the caller's membership or `models.read` API key, and the model and quote
+evidence. The report links to authenticated evidence endpoints that return the exact
+bytes identified by SHA-256. The operator must establish provenance and keep the
+manifest and evidence protected from unauthorized writes. This integration does not
+create measurements or provision a production artifact store.
 
 All file names passed to the function are relative to its evidence root. The result
 contains their relative paths and SHA-256 hashes, so the bytes used can be audited.
