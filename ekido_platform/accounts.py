@@ -15,7 +15,7 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, UniqueConstraint, func, select
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, func, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from .models import Base, Timestamped, User, utcnow
@@ -114,6 +114,19 @@ class JobOwner(Base):
     __tablename__ = "job_owners"
     job_id: Mapped[str] = mapped_column(String(36), primary_key=True)  # The Coordinator's job ID.
     org_id: Mapped[str] = mapped_column(ForeignKey("orgs.id"), index=True)
+
+
+class InferenceUsage(Base):
+    """An invocation reservation; never contains prompts or responses."""
+    __tablename__ = "inference_usage"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    key_id: Mapped[str] = mapped_column(ForeignKey("api_keys.id"), index=True)
+    model_id: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 @dataclass(frozen=True)

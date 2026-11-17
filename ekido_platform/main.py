@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     # The Coordinator, reached over localhost. Its operator token is only needed when the two run on different hosts.
     coordinator_url: str = "http://127.0.0.1:8003"
     coordinator_token: str = ""
+    inference_models_root: str = ""
+    inference_internal_token: str = ""
+    inference_rate_per_minute: int = 60
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -66,6 +69,10 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     router, principal = build_router(engine, sender=sender, site_url=settings.site_url, allowed_origins=settings.cors_origins, cookie_secure=settings.session_cookie_secure)
     app.include_router(router)
     app.state.principal = principal
+
+    from .v1_inference_authority import build_inference_authority
+    app.include_router(build_inference_authority(engine, settings.inference_models_root,
+                                                  settings.inference_internal_token, settings.inference_rate_per_minute))
 
     @app.exception_handler(AccountError)
     async def account_refused(_: Request, exc: AccountError):

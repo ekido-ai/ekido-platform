@@ -65,7 +65,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install "sqlalchemy>=2" "fastapi>=0.115" pydantic-settings eth-account web3 "alembic==1.20.1" "psycopg[binary]==3.3.6" "ekido-core @ git+https://github.com/ekido-ai/ekido-core@v0.4.0#subdirectory=packages/ekido_core"
+        run: pip install "sqlalchemy>=2" "fastapi>=0.115" httpx pydantic-settings eth-account web3 "alembic==1.20.1" "psycopg[binary]==3.3.6" "ekido-core @ git+https://github.com/ekido-ai/ekido-core@v0.4.0#subdirectory=packages/ekido_core"
       - name: This service's own user and schema, as ekido-infra's postgres.sh sets up
         run: |
           psql -h 127.0.0.1 -U postgres -d ekido -v ON_ERROR_STOP=1 <<'SQL'
@@ -85,5 +85,5 @@ jobs:
         run: |
           DATABASE_URL="$SERVICE_URL" python -m alembic -c alembic/alembic.ini upgrade head
           DATABASE_URL="$SERVICE_URL" python -m alembic -c alembic/alembic.ini check
-          TEST_DATABASE_URL="$SERVICE_URL" python -m unittest -v tests.test_postgres
+          TEST_DATABASE_URL="$SERVICE_URL" python -m unittest -v tests.test_postgres tests.test_inference_authority
           DATABASE_URL="$SERVICE_URL" python -m alembic -c alembic/alembic.ini downgrade base
