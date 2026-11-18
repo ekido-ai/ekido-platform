@@ -16,6 +16,13 @@ from ekido_platform.main import Settings, create_app
 
 
 class AssistantRoute(unittest.TestCase):
+    def test_policy_prompt_covers_published_prohibited_job_categories(self):
+        for category in ('break applicable law', 'sexualise children', 'harass, threaten, stalk',
+                         'impersonation, fake reviews, phishing, scams or spam',
+                         'write malware, attack systems', 'weapons capable of mass harm'):
+            with self.subTest(category=category):
+                self.assertIn(category, POLICY_SYSTEM)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

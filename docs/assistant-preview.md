@@ -1,5 +1,13 @@
 # Assistant job previews
 
+This branch requires the shared model table in
+[ekido-core #76](https://github.com/ekido-ai/ekido-core/pull/76), pinned to
+commit `4655af022b405bcd6066d125803ecafbd487f4f7` in CI. Deployments must
+install a core version containing that commit before enabling the assistant.
+The policy-screening categories follow the draft acceptable-use page in
+[ekido-web #21](https://github.com/ekido-ai/ekido-web/pull/21); that page
+itself is pending policy and legal review.
+
 `POST /v1/assistant/messages` is disabled until the operator configures a local
 Qwen2.5-1.5B-Instruct llama.cpp engine using `ASSISTANT_ENGINE_URL` and a secret
 of at least 32 characters using `ASSISTANT_STATE_SECRET`. The engine must use a

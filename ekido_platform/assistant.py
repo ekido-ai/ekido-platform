@@ -9,14 +9,8 @@ import json
 import re
 from typing import Any
 
-from ekido_core.job_spec import spec_problems
+from ekido_core.job_spec import MODEL_ALIASES as MODELS, spec_problems
 from ekido_core.recipes import RECIPES
-
-MODELS = {
-    'qwen2.5-0.5b-instruct': ('Qwen/Qwen2.5-0.5B-Instruct', '7ae557604adf67be50417f59c2c2f167def9a775'),
-    'qwen2.5-1.5b-instruct': ('Qwen/Qwen2.5-1.5B-Instruct', '989aa7980e4cf806f80c7fef2b1adb7bc71aa306'),
-}
-
 
 class AssistantError(ValueError):
     pass
