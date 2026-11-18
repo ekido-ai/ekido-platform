@@ -47,6 +47,17 @@ class SavingsReport(unittest.TestCase):
         self.assertEqual(result['quality']['api_score'], 0.81)
         self.assertEqual(self.report(self_hosted=True)['ekido']['hosting_monthly_paise'], 0)
 
+    def test_quality_gap_is_flagged_when_ekido_is_worse(self):
+        self.assertTrue(self.report()['quality']['comparable'])
+        self.files['model.json']['score'] = 0.80  # 0.01 below the API: within the margin
+        self.write_files()
+        self.assertTrue(self.report()['quality']['comparable'])
+        self.files['model.json']['score'] = 0.60
+        self.write_files()
+        quality = self.report()['quality']
+        self.assertFalse(quality['comparable'])
+        self.assertAlmostEqual(quality['difference'], -0.21)
+
     def test_different_or_missing_task_evidence_is_refused(self):
         for name, field, value in [('api.json', 'eval_set_hash', 'b' * 64),
                                    ('api.json', 'examples', 99), ('api.json', 'metric', 'rouge_l'),
