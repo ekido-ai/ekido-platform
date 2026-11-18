@@ -65,7 +65,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install "sqlalchemy>=2" "fastapi>=0.115" pydantic-settings eth-account web3 "alembic==1.20.1" "psycopg[binary]==3.3.6" "ekido-core @ git+https://github.com/ekido-ai/ekido-core@4655af022b405bcd6066d125803ecafbd487f4f7#subdirectory=packages/ekido_core"
+        run: pip install "sqlalchemy>=2" "fastapi>=0.115" pydantic-settings eth-account web3 "alembic==1.20.1" "psycopg[binary]==3.3.6" "ekido-core @ git+https://github.com/ekido-ai/ekido-core@v0.4.1#subdirectory=packages/ekido_core"
       - name: This service's own user and schema, as ekido-infra's postgres.sh sets up
         run: |
           psql -h 127.0.0.1 -U postgres -d ekido -v ON_ERROR_STOP=1 <<'SQL'
@@ -81,6 +81,8 @@ jobs:
           CREATE TABLE coordinator.jobs (id text PRIMARY KEY);
           ALTER TABLE coordinator.jobs OWNER TO ekido_coordinator;
           SQL
+      - name: Install shared model table revision
+        run: pip install --force-reinstall --no-deps "ekido-core @ git+https://github.com/ekido-ai/ekido-core@4655af022b405bcd6066d125803ecafbd487f4f7#subdirectory=packages/ekido_core"
       - name: Migrations, the model check and the write paths
         run: |
           DATABASE_URL="$SERVICE_URL" python -m alembic -c alembic/alembic.ini upgrade head
