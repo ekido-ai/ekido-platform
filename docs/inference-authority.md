@@ -14,6 +14,12 @@ HTTP origin on a numeric loopback address and a specified port. The directory
 must not be writable by customers. Only the operator can assign model ownership
 or an engine; these values must not come from request parameters.
 
+Set `"mode": "test"` for a test model. Test keys can reserve only test
+models; live keys can reserve only live models. An absent mode defaults to
+live, and invalid modes fail closed. Operators must ensure test engines and
+their upstream providers do not incur customer charges; billing is not yet
+implemented by this service.
+
 The internal `/internal/inference/ready` endpoint returns the loopback origins
 of configured, job-owned models to an authenticated router. The router probes
 engine health itself; merely having a manifest does not mean an engine is ready.

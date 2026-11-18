@@ -29,12 +29,13 @@ class InferenceAuthority(unittest.TestCase):
             org = accounts.create_org(session, user.id, 'Team One')
             session.add(JobOwner(job_id='job1', org_id=org.id))
             _, self.key = accounts.create_api_key(session, org.id, user.id, 'predict', 'test', ['models.predict'])
+            _, self.live_key = accounts.create_api_key(session, org.id, user.id, 'predict live', 'live', ['models.predict'])
             _, self.no_scope = accounts.create_api_key(session, org.id, user.id, 'no scope', 'test', ['jobs'])
             other, _ = accounts.finish_login(session, accounts.start_login(session, 'two@example.com'))
             other_org = accounts.create_org(session, other.id, 'Team Two')
             _, self.other_key = accounts.create_api_key(session, other_org.id, other.id, 'predict', 'test', ['models.predict'])
             session.commit()
-        self.manifest = {'job_id': 'job1', 'engine_url': 'http://127.0.0.1:19081', 'engine_model': 'local-model'}
+        self.manifest = {'job_id': 'job1', 'engine_url': 'http://127.0.0.1:19081', 'engine_model': 'local-model', 'mode': 'test'}
         self.write_manifest()
         self.client = TestClient(self.app)
         self.headers = {'x-ekido-inference-token': self.token}
@@ -78,6 +79,22 @@ class InferenceAuthority(unittest.TestCase):
             row = session.get(InferenceUsage, reservation)
             self.assertEqual((row.status, row.input_tokens, row.output_tokens), ('ok', 3, 2))
             self.assertNotIn(self.key, str(row.__dict__))
+
+    def test_test_keys_cannot_reserve_live_or_unmarked_models(self):
+        self.assertEqual(self.reserve(key=self.live_key).status_code, 404)
+        for mode in ('live', None, 'invalid'):
+            with self.subTest(mode=mode):
+                if mode is None:
+                    self.manifest.pop('mode', None)
+                else:
+                    self.manifest['mode'] = mode
+                self.write_manifest()
+                self.assertEqual(self.reserve().status_code, 404)
+        with Session(self.app.state.engine) as session:
+            self.assertEqual(session.query(InferenceUsage).count(), 0)
+        self.manifest.pop('mode', None)
+        self.write_manifest()
+        self.assertEqual(self.reserve(key=self.live_key).status_code, 200)
 
     def test_untrusted_or_malformed_manifest_is_not_routed(self):
         for url in ('http://example.com:80', 'http://10.0.0.1:1234', 'http://127.0.0.1:1234/x',
@@ -131,7 +148,7 @@ class PostgresRateLimit(unittest.TestCase):
         self.addCleanup(cleanup)
         with tempfile.TemporaryDirectory() as temp:
             Path(temp, 'm.json').write_text(json.dumps({'job_id': job_id, 'engine_url': 'http://127.0.0.1:9000',
-                                                        'engine_model': 'm'}), encoding='utf-8')
+                                                        'engine_model': 'm', 'mode': 'test'}), encoding='utf-8')
             token = 'concurrency-test-token-' + 'x' * 32
             settings = Settings(database_url=os.environ['TEST_DATABASE_URL'], _env_file=None,
                 inference_models_root=temp, inference_internal_token=token, inference_rate_per_minute=2)

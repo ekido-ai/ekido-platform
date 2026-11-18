@@ -55,6 +55,8 @@ def model_manifest(root: Path, model_id: str) -> dict:
             not all(isinstance(item.get(k), str) and item[k] for k in ("job_id", "engine_url", "engine_model")) or
             len(item["job_id"]) > 36 or len(item["engine_url"]) > 512 or len(item["engine_model"]) > 200):
         raise ValueError("invalid manifest")
+    if item.get("mode", "live") not in ("test", "live"):
+        raise ValueError("invalid model mode")
     url = urlsplit(item["engine_url"])
     if (url.scheme != "http" or url.username is not None or url.password is not None or
             url.path not in ("", "/") or url.query or url.fragment or url.port is None or
@@ -114,6 +116,8 @@ def build_inference_authority(engine: Engine, model_root: str, internal_token: s
                 raise AccountError("NOT_FOUND", "No such model.", 404) from None
             owner = session.get(JobOwner, manifest["job_id"])
             if owner is None or owner.org_id != key.org_id:
+                raise AccountError("NOT_FOUND", "No such model.", 404)
+            if key.mode != manifest.get("mode", "live"):
                 raise AccountError("NOT_FOUND", "No such model.", 404)
             count = session.scalar(select(func.count()).select_from(InferenceUsage).where(
                 InferenceUsage.key_id == key.id, InferenceUsage.created_at >= now - timedelta(minutes=1)))
