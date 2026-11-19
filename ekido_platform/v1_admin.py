@@ -1,0 +1,161 @@
+"""The owner's admin area (ticket C26): teams, jobs, payments and provider identities, plus cancel, with every change
+written to an audit log.
+
+Only a signed-in person whose email is in ADMIN_EMAILS gets in; everyone else, API keys included, gets 404, so the
+routes don't announce themselves. Jobs, providers and settlements live in the Coordinator: this service reads them
+server-side (same host, or with COORDINATOR_TOKEN), so the operator token never reaches a browser. Provider identities
+are visible only through these routes.
+"""
+
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime
+from typing import Any, Callable
+
+from fastapi import APIRouter, Depends
+from sqlalchemy import JSON, DateTime, String, func, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Mapped, Session, mapped_column
+
+from . import accounts
+from .accounts import AccountError, ApiKey, Org, OrgMember, Principal, UserEmail
+from .models import Base, utcnow
+
+# (status, parsed JSON body); raises OSError when the Coordinator can't be reached.
+CoordinatorCall = Callable[[str, str], tuple[int, Any]]
+
+
+class AdminAction(Base):
+    """One change made from the admin area: who, when, what and on what."""
+
+    __tablename__ = "admin_actions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    user_id: Mapped[str] = mapped_column(String(36))
+    email: Mapped[str] = mapped_column(String(320))
+    action: Mapped[str] = mapped_column(String(40))
+    target: Mapped[str] = mapped_column(String(120))
+    outcome: Mapped[str] = mapped_column(String(16))
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+def coordinator_client(base_url: str, token: str, timeout: float = 10.0) -> CoordinatorCall:
+    """Calls the Coordinator's operator API. No redirects are followed; responses are capped at 2 MB."""
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+    def call(method: str, path: str) -> tuple[int, Any]:
+        request = urllib.request.Request(base_url.rstrip("/") + path, method=method, data=b"" if method == "POST" else None)
+        if token:
+            request.add_header("Authorization", f"Bearer {token}")
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                status, raw = response.status, response.read(2_000_001)
+        except urllib.error.HTTPError as error:
+            status, raw = error.code, error.read(2_000_001)
+        if len(raw) > 2_000_000:
+            raise OSError("Coordinator response too large")
+        try:
+            return status, json.loads(raw) if raw else None
+        except ValueError:
+            return status, None
+
+    return call
+
+
+def build_admin_router(engine: Engine, principal: Callable, admin_emails: list[str], coordinator: CoordinatorCall) -> APIRouter:
+    router = APIRouter(prefix="/v1/admin")
+    allowed = {accounts.normalise_email(e) for e in admin_emails if e.strip()}
+
+    def db():
+        with Session(engine) as session:
+            yield session
+
+    def admin(who: Principal = Depends(principal), session: Session = Depends(db)) -> tuple[str, str]:
+        email = None
+        if who.via == "session" and who.user_id:
+            email = session.scalar(select(UserEmail.email).where(UserEmail.user_id == who.user_id))
+        if not allowed or email is None or accounts.normalise_email(email) not in allowed:
+            raise AccountError("NOT_FOUND", "Not found.", 404)
+        return who.user_id, email
+
+    def read(path: str) -> Any:
+        try:
+            status, body = coordinator("GET", path)
+        except OSError:
+            raise AccountError("COORDINATOR_UNAVAILABLE", "The Coordinator didn't answer.", 503) from None
+        if status == 404:
+            raise AccountError("NOT_FOUND", "Not found.", 404)
+        if status >= 400:
+            raise AccountError("COORDINATOR_ERROR", f"The Coordinator refused ({status}).", 502)
+        return body
+
+    def log(session: Session, who: tuple[str, str], action: str, target: str, outcome: str, detail: dict) -> None:
+        session.add(AdminAction(id=str(uuid.uuid4()), at=utcnow(), user_id=who[0], email=who[1], action=action,
+                                target=target, outcome=outcome, detail=detail))
+        session.commit()
+
+    @router.get("/orgs")
+    def orgs(who: tuple[str, str] = Depends(admin), session: Session = Depends(db)) -> list[dict[str, Any]]:
+        members = dict(session.execute(select(OrgMember.org_id, func.count()).group_by(OrgMember.org_id)).all())
+        keys = dict(session.execute(select(ApiKey.org_id, func.count()).where(ApiKey.revoked_at.is_(None)).group_by(ApiKey.org_id)).all())
+        return [{"org_id": o.id, "name": o.name, "members": members.get(o.id, 0), "active_keys": keys.get(o.id, 0),
+                 "created_at": o.created_at.isoformat() if o.created_at else None}
+                for o in session.scalars(select(Org).order_by(Org.created_at.desc()))]
+
+    @router.get("/orgs/{org_id}")
+    def org(org_id: str, who: tuple[str, str] = Depends(admin), session: Session = Depends(db)) -> dict[str, Any]:
+        if session.get(Org, org_id) is None:
+            raise AccountError("NOT_FOUND", "Not found.", 404)
+        return {**accounts.org_view(session, org_id), "api_keys": accounts.list_api_keys(session, org_id)}
+
+    @router.get("/jobs")
+    def jobs(who: tuple[str, str] = Depends(admin)) -> Any:
+        return read("/jobs?limit=100")
+
+    @router.get("/jobs/{job_id}")
+    def job(job_id: str, who: tuple[str, str] = Depends(admin)) -> Any:
+        quoted = urllib.parse.quote(job_id, safe="")
+        return {"job": read(f"/jobs/{quoted}"), "checkpoints": read(f"/jobs/{quoted}/checkpoints")}
+
+    @router.get("/providers")
+    def providers(who: tuple[str, str] = Depends(admin)) -> Any:
+        return read("/providers")
+
+    @router.get("/payments")
+    def payments(who: tuple[str, str] = Depends(admin)) -> Any:
+        return read("/settlements")
+
+    @router.post("/jobs/{job_id}/cancel")
+    def cancel(job_id: str, who: tuple[str, str] = Depends(admin), session: Session = Depends(db)) -> Any:
+        quoted = urllib.parse.quote(job_id, safe="")
+        try:
+            status, body = coordinator("POST", f"/jobs/{quoted}/cancel")
+        except OSError:
+            log(session, who, "job.cancel", job_id, "unreachable", {})
+            raise AccountError("COORDINATOR_UNAVAILABLE", "The Coordinator didn't answer; nothing was cancelled.", 503) from None
+        outcome = "done" if status < 400 else "refused"
+        log(session, who, "job.cancel", job_id, outcome, {"status": status, "state": body.get("state") if isinstance(body, dict) else None})
+        if status == 404:
+            raise AccountError("NOT_FOUND", "No such job.", 404)
+        if status >= 400:
+            detail = body.get("detail") if isinstance(body, dict) else None
+            raise AccountError("CANCEL_REFUSED", str(detail or f"The Coordinator refused ({status})."), 409)
+        return body
+
+    @router.get("/audit")
+    def audit(who: tuple[str, str] = Depends(admin), session: Session = Depends(db)) -> list[dict[str, Any]]:
+        rows = session.scalars(select(AdminAction).order_by(AdminAction.at.desc()).limit(200))
+        return [{"id": r.id, "at": r.at.isoformat(), "email": r.email, "action": r.action, "target": r.target,
+                 "outcome": r.outcome, "detail": r.detail} for r in rows]
+
+    return router
