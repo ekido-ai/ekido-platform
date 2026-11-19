@@ -110,6 +110,18 @@ class Gateway(Protocol):
     def list_payments(self, *, from_ts: int, to_ts: int) -> list[dict]:
         """Every payment in the time window."""
 
+    def create_subscription(self, *, plan_id: str, total_count: int, notes: dict) -> dict:
+        """Start a monthly subscription on a Razorpay plan; returns its id and status."""
+
+    def fetch_subscription(self, subscription_id: str) -> dict:
+        """A subscription as Razorpay has it: id, plan_id, status, current_start, current_end."""
+
+    def cancel_subscription(self, subscription_id: str, *, at_cycle_end: bool) -> dict:
+        """Cancel now, or when the paid period ends."""
+
+    def update_subscription(self, subscription_id: str, *, plan_id: str) -> dict:
+        """Move a subscription to another Razorpay plan, from now."""
+
 
 class RazorpayHttpGateway:
     """Razorpay's REST API with HTTP basic auth. Refuses live keys: this build is test mode only."""
@@ -144,6 +156,18 @@ class RazorpayHttpGateway:
 
     def refund_payment(self, payment_id: str, amount_paise: int, *, receipt: str) -> dict:
         return self._call("POST", f"/payments/{payment_id}/refund", {"amount": amount_paise, "receipt": receipt})
+
+    def create_subscription(self, *, plan_id: str, total_count: int, notes: dict) -> dict:
+        return self._call("POST", "/subscriptions", {"plan_id": plan_id, "total_count": total_count, "customer_notify": 1, "notes": notes})
+
+    def fetch_subscription(self, subscription_id: str) -> dict:
+        return self._call("GET", f"/subscriptions/{subscription_id}")
+
+    def cancel_subscription(self, subscription_id: str, *, at_cycle_end: bool) -> dict:
+        return self._call("POST", f"/subscriptions/{subscription_id}/cancel", {"cancel_at_cycle_end": 1 if at_cycle_end else 0})
+
+    def update_subscription(self, subscription_id: str, *, plan_id: str) -> dict:
+        return self._call("PATCH", f"/subscriptions/{subscription_id}", {"plan_id": plan_id, "schedule_change_at": "now"})
 
     def list_payments(self, *, from_ts: int, to_ts: int) -> list[dict]:
         found, skip = [], 0
@@ -187,8 +211,10 @@ class Reconciliation:
 
 
 class RazorpayRail:
-    def __init__(self, gateway: Gateway, webhook_secret: str):
+    def __init__(self, gateway: Gateway, webhook_secret: str, on_subscription_event=None):
         self.gateway, self._webhook_secret = gateway, webhook_secret
+        # Called with (session, subscription_id) for every subscription.* event; the plans service syncs from Razorpay.
+        self.on_subscription_event = on_subscription_event
 
     # -- 1. order
     def create_order(self, session: Session, *, org_id: str, quote_id: str, quote: dict) -> PaymentOrder:
@@ -230,6 +256,9 @@ class RazorpayRail:
             outcome = self._on_captured(session, entity)
         elif event == "payment.failed":
             outcome = self._on_failed(session, entity)
+        elif event.startswith("subscription."):
+            sub = (((body.get("payload") or {}).get("subscription") or {}).get("entity")) or {}
+            outcome = self.on_subscription_event(session, sub.get("id")) if self.on_subscription_event and sub.get("id") else "ignored"
         else:
             outcome = "ignored"
         session.add(WebhookEvent(event_id=key, event=event[:60], outcome=outcome[:40]))

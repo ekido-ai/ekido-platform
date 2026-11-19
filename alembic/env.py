@@ -5,7 +5,7 @@ import os
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from ekido_platform import accounts, payments, v1_admin  # noqa: F401  (v1_admin: admin_actions; payments: payment_orders, webhook_events, ledger_entries)
+from ekido_platform import accounts, payments, plans, v1_admin  # noqa: F401  (v1_admin: admin_actions; payments: orders, events, ledger; plans: team_plans, plan_usage)
 
 config = context.config
 url = os.environ.get("DATABASE_URL")

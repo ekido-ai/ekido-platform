@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""
+    # The Razorpay plan ids for Starter and Business (created in the test-mode dashboard; ids are not secrets).
+    razorpay_plan_starter: str = ""
+    razorpay_plan_business: str = ""
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -63,7 +66,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     engine = engine or create_engine_for(settings.database_url)
     # SQLite (tests): create the tables. Postgres: the schema belongs to the migrations in apps/platform/alembic,
     # which the service unit runs before it starts.
-    from . import payments, v1_admin  # noqa: F401  (register their tables before create_all)
+    from . import payments, plans, v1_admin  # noqa: F401  (register their tables before create_all)
 
     if engine.dialect.name == "sqlite":
         Base.metadata.create_all(engine)
@@ -95,6 +98,12 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     if settings.razorpay_key_id and settings.razorpay_key_secret and settings.razorpay_webhook_secret:
         rail = RazorpayRail(RazorpayHttpGateway(settings.razorpay_key_id, settings.razorpay_key_secret), settings.razorpay_webhook_secret)
     app.state.payment_rail = rail
+    app.state.plans = None
+    if rail is not None and settings.razorpay_plan_starter and settings.razorpay_plan_business:
+        from .plans import PlansService
+
+        app.state.plans = PlansService(rail.gateway, {"starter": settings.razorpay_plan_starter, "business": settings.razorpay_plan_business})
+        rail.on_subscription_event = app.state.plans.sync_subscription
     app.include_router(build_payments_router(engine, rail))
 
     @app.exception_handler(AccountError)
