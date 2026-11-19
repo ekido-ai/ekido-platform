@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     # The Coordinator, reached over localhost. Its operator token is only needed when the two run on different hosts.
     coordinator_url: str = "http://127.0.0.1:8003"
     coordinator_token: str = ""
+    inference_models_root: str = ""
+    inference_internal_token: str = ""
+    inference_rate_per_minute: int = 60
     # Operator-managed evidence and per-model manifests; empty disables savings reports.
     savings_evidence_root: str = ""
 
@@ -69,6 +72,9 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     app.include_router(router)
     app.state.principal = principal
 
+    from .v1_inference_authority import build_inference_authority
+    app.include_router(build_inference_authority(engine, settings.inference_models_root,
+                                                  settings.inference_internal_token, settings.inference_rate_per_minute))
     from .v1_savings import build_savings_router
     app.include_router(build_savings_router(engine, principal, settings.savings_evidence_root))
 
