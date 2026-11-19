@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     inference_rate_per_minute: int = 60
     # Operator-managed evidence and per-model manifests; empty disables savings reports.
     savings_evidence_root: str = ""
+    # Emails allowed into the owner's admin area (ticket C26). Empty keeps it closed to everyone.
+    admin_emails: list[str] = []
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -56,6 +58,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     engine = engine or create_engine_for(settings.database_url)
     # SQLite (tests): create the tables. Postgres: the schema belongs to the migrations in apps/platform/alembic,
     # which the service unit runs before it starts.
+    from . import v1_admin  # noqa: F401  (registers the admin_actions table before create_all)
+
     if engine.dialect.name == "sqlite":
         Base.metadata.create_all(engine)
 
@@ -77,6 +81,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
                                                   settings.inference_internal_token, settings.inference_rate_per_minute))
     from .v1_savings import build_savings_router
     app.include_router(build_savings_router(engine, principal, settings.savings_evidence_root))
+    app.include_router(v1_admin.build_admin_router(engine, principal, settings.admin_emails,
+                                                   v1_admin.coordinator_client(settings.coordinator_url, settings.coordinator_token)))
 
     @app.exception_handler(AccountError)
     async def account_refused(_: Request, exc: AccountError):
