@@ -1,9 +1,7 @@
 # Assistant job previews
 
-This branch requires the shared model table in
-[ekido-core #76](https://github.com/ekido-ai/ekido-core/pull/76), pinned to
-commit `4655af022b405bcd6066d125803ecafbd487f4f7` in CI. Deployments must
-install a core version containing that commit before enabling the assistant.
+The shared model table is provided by the released `ekido-core` v0.4.2 tag;
+deployments must use v0.4.2 or a compatible newer release.
 The policy-screening categories follow the draft acceptable-use page in
 [ekido-web #21](https://github.com/ekido-ai/ekido-web/pull/21); that page
 itself is pending policy and legal review.

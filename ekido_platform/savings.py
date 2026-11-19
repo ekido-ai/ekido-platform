@@ -16,6 +16,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
+# How far below the API's score Ekido's may be and still count as doing the same job. It matches the default
+# non-inferiority margin in the job quality policy (0.02).
+QUALITY_MARGIN = Decimal('0.02')
+
+
 class SavingsError(ValueError):
     pass
 
@@ -154,7 +159,10 @@ def build_savings_report(*, evidence_root: Path, model_id: str, expected_request
                          'source_currency': source_currency, 'conversion': conversion},
         'ekido': {'training_paise': training, 'hosting_monthly_paise': hosting_paise},
         'quality': {'ekido_score': float(model_score), 'api_score': float(api_score),
-                    'metric': model['metric'], 'eval_set_hash': test_hash, 'examples': examples},
+                    'metric': model['metric'], 'eval_set_hash': test_hash, 'examples': examples,
+                    'difference': float(model_score - api_score), 'margin': float(QUALITY_MARGIN),
+                    # Savings only mean something for a model that does the job about as well.
+                    'comparable': model_score >= api_score - QUALITY_MARGIN},
         'first_month_difference_paise': api_paise - training - hosting_paise,
         'later_month_difference_paise': api_paise - hosting_paise,
         'sources': list(sources), 'source_sha256': sources,
