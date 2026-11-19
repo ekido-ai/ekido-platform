@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     savings_evidence_root: str = ""
     # Emails allowed into the owner's admin area (ticket C26). Empty keeps it closed to everyone.
     admin_emails: list[str] = []
+    # Razorpay, test mode only (ticket C7). The key id is public; the secret and the webhook secret come from the environment
+    # (AWS SSM on the servers) and are never in the repo. With any of the three empty, the webhook answers 503.
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""
+    razorpay_webhook_secret: str = ""
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -58,7 +63,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     engine = engine or create_engine_for(settings.database_url)
     # SQLite (tests): create the tables. Postgres: the schema belongs to the migrations in apps/platform/alembic,
     # which the service unit runs before it starts.
-    from . import v1_admin  # noqa: F401  (registers the admin_actions table before create_all)
+    from . import payments, v1_admin  # noqa: F401  (register their tables before create_all)
 
     if engine.dialect.name == "sqlite":
         Base.metadata.create_all(engine)
@@ -83,6 +88,14 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     app.include_router(build_savings_router(engine, principal, settings.savings_evidence_root))
     app.include_router(v1_admin.build_admin_router(engine, principal, settings.admin_emails,
                                                    v1_admin.coordinator_client(settings.coordinator_url, settings.coordinator_token)))
+
+    from .payments import RazorpayHttpGateway, RazorpayRail
+    from .v1_payments import build_payments_router
+    rail = None
+    if settings.razorpay_key_id and settings.razorpay_key_secret and settings.razorpay_webhook_secret:
+        rail = RazorpayRail(RazorpayHttpGateway(settings.razorpay_key_id, settings.razorpay_key_secret), settings.razorpay_webhook_secret)
+    app.state.payment_rail = rail
+    app.include_router(build_payments_router(engine, rail))
 
     @app.exception_handler(AccountError)
     async def account_refused(_: Request, exc: AccountError):
