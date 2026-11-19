@@ -5,7 +5,7 @@ import os
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from ekido_platform import accounts
+from ekido_platform import accounts, v1_admin  # noqa: F401  (v1_admin defines the admin_actions table)
 
 config = context.config
 url = os.environ.get("DATABASE_URL")
