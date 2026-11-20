@@ -55,12 +55,51 @@ class SesEmail:
         self.client, self.sender = client, sender
 
     def send_login_link(self, email: str, link: str) -> None:
-        text = f"Sign in to Ekido:\n\n{link}\n\nThe link works once, for 15 minutes. If you didn't ask for it, ignore this email."
-        self.client.send_email(
-            Source=self.sender,
-            Destination={"ToAddresses": [email]},
-            Message={"Subject": {"Data": "Your Ekido sign-in link"}, "Body": {"Text": {"Data": text}}},
-        )
+        try:
+            self.client.send_email(
+                Source=self.sender,
+                Destination={"ToAddresses": [email]},
+                Message={"Subject": {"Data": SUBJECT}, "Body": {"Text": {"Data": login_text(link)}}},
+            )
+        except Exception as error:  # botocore errors, e.g. MessageRejected for an unverified address in the SES sandbox
+            raise not_sent(error) from None
+
+
+class SmtpEmail:
+    """Any SMTP server with STARTTLS (for example Gmail with an app password). The password comes from the environment."""
+
+    def __init__(self, host: str, port: int, user: str, password: str, sender: str, smtp_class=None, timeout: float = 15.0):
+        import smtplib
+
+        self.smtp_class = smtp_class or smtplib.SMTP
+        self.host, self.port, self.user, self.password, self.sender, self.timeout = host, port, user, password, sender, timeout
+
+    def send_login_link(self, email: str, link: str) -> None:
+        from email.message import EmailMessage
+
+        message = EmailMessage()
+        message["From"], message["To"], message["Subject"] = self.sender, email, SUBJECT
+        message.set_content(login_text(link))
+        try:
+            with self.smtp_class(self.host, self.port, timeout=self.timeout) as smtp:
+                smtp.starttls()
+                smtp.login(self.user, self.password)
+                smtp.send_message(message)
+        except Exception as error:  # smtplib and socket errors
+            raise not_sent(error) from None
+
+
+SUBJECT = "Your Ekido sign-in link"
+
+
+def login_text(link: str) -> str:
+    return f"Sign in to Ekido:\n\n{link}\n\nThe link works once, for 15 minutes. If you didn't ask for it, ignore this email."
+
+
+def not_sent(error: Exception) -> AccountError:
+    """A clear answer instead of a 500. Only the error's type is logged: never the link or the password."""
+    log.warning("sign-in email not sent: %s", error.__class__.__name__)
+    return AccountError("EMAIL_NOT_SENT", "We couldn't send the email. Check the address, or try again in a minute.", 503)
 
 
 class Strict(BaseModel):
