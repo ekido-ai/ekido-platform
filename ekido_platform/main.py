@@ -19,7 +19,7 @@ from sqlalchemy.pool import StaticPool
 
 from .accounts import AccountError
 from .models import Base
-from .v1_accounts import LogEmail, NoEmail, SesEmail, build_router, error
+from .v1_accounts import LogEmail, NoEmail, SesEmail, SmtpEmail, build_router, error
 
 log = logging.getLogger(__name__)
 
@@ -28,11 +28,16 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     database_url: str = "sqlite://"
-    # Where sign-in links point, and how they're sent: "none", "log" (staging only) or "ses".
+    # Where sign-in links point, and how they're sent: "none", "log" (staging only), "ses" or "smtp".
     site_url: str = "http://localhost:3100"
     email_sender: str = "none"
     email_from: str = ""
     email_region: str = ""
+    # EMAIL_SENDER=smtp: a STARTTLS server such as smtp.gmail.com:587. SMTP_PASSWORD comes from the environment only.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
     session_cookie_secure: bool = True
     cors_origins: list[str] = ["http://localhost:3100", "http://127.0.0.1:3100"]
     # The Coordinator, reached over localhost. Its operator token is only needed when the two run on different hosts.
@@ -87,6 +92,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
 
     if settings.email_sender == "ses":
         sender = SesEmail(settings.email_from, region=settings.email_region or None)
+    elif settings.email_sender == "smtp":
+        sender = SmtpEmail(settings.smtp_host, settings.smtp_port, settings.smtp_user, settings.smtp_password, settings.email_from)
     else:
         sender = {"log": LogEmail}.get(settings.email_sender, NoEmail)()
     router, principal = build_router(engine, sender=sender, site_url=settings.site_url, allowed_origins=settings.cors_origins, cookie_secure=settings.session_cookie_secure)
