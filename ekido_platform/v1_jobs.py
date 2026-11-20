@@ -12,6 +12,7 @@ can try again. A team and a member cannot start a job from another team's order:
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -69,6 +70,52 @@ def coordinator_poster(base_url: str, token: str, timeout: float = 20.0) -> Coor
     return call
 
 
+STALE_CLAIM_SECONDS = 600
+
+
+def claim_marker(now: float | None = None) -> str:
+    """`claim-<unix time>-<random>`: the time lets a claim left by a crashed request be recognised later (36 characters at most)."""
+    return f"claim-{int(now if now is not None else time.time())}-{uuid.uuid4().hex[:19]}"
+
+
+def is_stale_claim(job_id: str | None, now: float | None = None) -> bool:
+    if not job_id or not job_id.startswith("claim-"):
+        return False
+    try:
+        stamp = int(job_id.split("-")[1])
+    except (IndexError, ValueError):
+        return True  # a claim we cannot read is not one of ours worth keeping
+    return (now if now is not None else time.time()) - stamp > STALE_CLAIM_SECONDS
+
+
+def workload_problems(quote: dict, workload: dict) -> list[str]:
+    """What the customer is sending must be what they paid for: same recipe, model and data, and no more work than the quote's plan."""
+    plan = quote.get("plan", {})
+    model, dataset = workload.get("model"), workload.get("dataset")
+    model = model if isinstance(model, dict) else {}
+    dataset = dataset if isinstance(dataset, dict) else {}
+    problems = []
+    if workload.get("template") != "llm-lora/v1":
+        problems.append("template must be llm-lora/v1")
+    if workload.get("recipe_id") != quote.get("recipe_id"):
+        problems.append("recipe_id is not the recipe that was quoted")
+    if model.get("id") != quote.get("base_model"):
+        problems.append("model.id is not the base model that was quoted")
+    if dataset.get("sha256") != quote.get("dataset_sha256"):
+        problems.append("dataset.sha256 is not the dataset that was quoted")
+    if dataset.get("test_rows") != quote.get("test_rows"):
+        problems.append("dataset.test_rows is not what was quoted")
+    train = dataset.get("train_rows")
+    if type(train) is not int or train > plan.get("train_rows", 0) + plan.get("generated_rows", 0):
+        problems.append("dataset.train_rows is more than was quoted")
+    steps = workload.get("total_logical_steps")
+    if type(steps) is not int or steps > plan.get("total_logical_steps", 0):
+        problems.append("total_logical_steps is more than was quoted")
+    if workload.get("logical_batch_size") != plan.get("logical_batch_size"):
+        problems.append("logical_batch_size is not what was quoted")
+    return problems
+
+
 def build_jobs_router(engine: Engine, principal: Callable, coordinator: CoordinatorPost) -> APIRouter:
     router = APIRouter(prefix="/v1")
 
@@ -88,7 +135,12 @@ def build_jobs_router(engine: Engine, principal: Callable, coordinator: Coordina
             raise AccountError("NOT_FOUND", "No such order.", 404)
         if order.status != HELD:
             raise AccountError("NOT_PAID", f"This order is {order.status}, so no job can start from it.", 409)
-        claim = "claim-" + uuid.uuid4().hex[:28]
+        if is_stale_claim(order.job_id):  # a request that died after claiming left this behind; let the customer try again
+            release(session, order.id, order.job_id)
+        problems = workload_problems(order.quote, body.workload)
+        if problems:
+            raise AccountError("WORKLOAD_MISMATCH", "This is not what was paid for: " + "; ".join(problems) + ".", 422)
+        claim = claim_marker()
         taken = session.execute(update(PaymentOrder).where(PaymentOrder.id == order.id, PaymentOrder.job_id.is_(None)).values(job_id=claim))
         session.commit()
         if taken.rowcount != 1:

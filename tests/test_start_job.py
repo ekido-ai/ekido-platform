@@ -17,7 +17,9 @@ from ekido_platform.main import Settings, create_app
 from ekido_platform.payments import PaymentOrder
 
 SITE = "https://ekido.example"
-BODY = {"workload": {"template": "llm-lora/v1"}, "policy": {"min": 1}}
+WORKLOAD = {"template": "llm-lora/v1", "recipe_id": "ticket-sorter-hinglish", "model": {"id": "Qwen/Qwen2.5-0.5B-Instruct", "revision": "r1"},
+            "dataset": {"sha256": "a" * 64, "bytes": 1000, "train_rows": 300, "test_rows": 40}, "total_logical_steps": 57, "logical_batch_size": 16}
+BODY = {"workload": WORKLOAD, "policy": {"min": 1}}
 
 
 class FakeCoordinator:
@@ -136,6 +138,64 @@ class Start(Base):
         order_id, _ = self.order(org)
         self.assertEqual(self.start("asha@example.com", org, order_id, budget_usdc="9999").status_code, 422)
         self.assertEqual(self.start("asha@example.com", org, order_id, deadline_seconds=0).status_code, 422)
+
+
+class Workload(Base):
+    def attempt(self, **changes):
+        org = self.org()
+        order_id, _ = self.order(org)
+        workload = {**WORKLOAD, **changes}
+        r = self.client("asha@example.com").post(f"/v1/orgs/{org}/jobs", json={"order_id": order_id, "workload": workload, "policy": {}})
+        return r, order_id
+
+    def test_a_workload_that_differs_from_the_quote_is_refused_before_the_coordinator_is_called(self):
+        wrong = {
+            "template": {"template": "other"}, "recipe_id": {"recipe_id": "something-else"},
+            "model": {"model": {"id": "Big/Model-70B", "revision": "r1"}},
+            "dataset sha": {"dataset": {**WORKLOAD["dataset"], "sha256": "b" * 64}},
+            "test rows": {"dataset": {**WORKLOAD["dataset"], "test_rows": 41}},
+            "more rows": {"dataset": {**WORKLOAD["dataset"], "train_rows": 301}},
+            "more steps": {"total_logical_steps": 58},
+            "batch": {"logical_batch_size": 64},
+            "steps as text": {"total_logical_steps": "57"},
+        }
+        for name, change in wrong.items():
+            with self.subTest(name):
+                r, order_id = self.attempt(**change)
+                self.assertEqual((r.status_code, r.json()["error"]), (422, "WORKLOAD_MISMATCH"))
+                self.assertIsNone(self.order_row(order_id))
+        self.assertEqual(self.coordinator.calls, [])
+
+    def test_less_work_than_quoted_is_allowed(self):
+        r, _ = self.attempt(total_logical_steps=30, dataset={**WORKLOAD["dataset"], "train_rows": 200})
+        self.assertEqual(r.status_code, 201)
+
+    def test_a_missing_field_is_a_mismatch_not_a_crash(self):
+        org = self.org()
+        order_id, _ = self.order(org)
+        r = self.client("asha@example.com").post(f"/v1/orgs/{org}/jobs", json={"order_id": order_id, "workload": {}, "policy": {}})
+        self.assertEqual((r.status_code, r.json()["error"]), (422, "WORKLOAD_MISMATCH"))
+
+
+class StaleClaims(Base):
+    def test_a_claim_left_by_a_crashed_request_is_released_after_ten_minutes_and_not_before(self):
+        from ekido_platform import v1_jobs
+        import time
+        org = self.org()
+        order_id, _ = self.order(org)
+        for age, expected in ((60, 409), (601, 201)):
+            with Session(self.engine) as s:
+                s.get(PaymentOrder, order_id).job_id = v1_jobs.claim_marker(time.time() - age)
+                s.commit()
+            self.assertEqual(self.start("asha@example.com", org, order_id).status_code, expected, age)
+
+    def test_markers_fit_the_column_and_unreadable_claims_count_as_stale(self):
+        from ekido_platform import v1_jobs
+        self.assertLessEqual(len(v1_jobs.claim_marker()), 36)
+        self.assertTrue(v1_jobs.is_stale_claim("claim-garbage"))
+        self.assertFalse(v1_jobs.is_stale_claim("a-real-job-id"))
+        self.assertFalse(v1_jobs.is_stale_claim(None))
+        self.assertFalse(v1_jobs.is_stale_claim(v1_jobs.claim_marker()))
 
 
 class Failures(Base):
