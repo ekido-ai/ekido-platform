@@ -48,6 +48,20 @@ class Settings(BaseSettings):
     assistant_datasets_root: str = ""
     # Emails allowed into the owner's admin area (ticket C26). Empty keeps it closed to everyone.
     admin_emails: list[str] = []
+    # Razorpay, test mode only (ticket C7). The key id is public; the secret and the webhook secret come from the environment
+    # (AWS SSM on the servers) and are never in the repo. With any of the three empty, the webhook answers 503.
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""
+    razorpay_webhook_secret: str = ""
+    # The Razorpay plan ids for Starter and Business (created in the test-mode dashboard; ids are not secrets).
+    razorpay_plan_starter: str = ""
+    razorpay_plan_business: str = ""
+    # Invoices (C8): who issues them, and whether they are still "TEST INVOICE: not a tax invoice" (until the company has a GSTIN).
+    seller_name: str = "Ekido (test)"
+    seller_gstin: str = ""
+    invoice_test_mode: bool = True
+    # Shared secret for the Coordinator-only routes under /internal (erasure tasks, settle and refund). Empty keeps them closed (404).
+    internal_token: str = ""
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -61,7 +75,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
     engine = engine or create_engine_for(settings.database_url)
     # SQLite (tests): create the tables. Postgres: the schema belongs to the migrations in apps/platform/alembic,
     # which the service unit runs before it starts.
-    from . import v1_admin  # noqa: F401  (registers the admin_actions table before create_all)
+    from . import payments, plans, privacy, v1_admin, v1_invoices  # noqa: F401  (register their tables before create_all)
 
     if engine.dialect.name == "sqlite":
         Base.metadata.create_all(engine)
@@ -91,6 +105,57 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
     app.include_router(build_assistant_router(engine, principal, settings.assistant_engine_url,
         settings.assistant_state_secret, settings.assistant_datasets_root, transport=assistant_transport))
 
+    from .payments import RazorpayHttpGateway, RazorpayRail
+    from .v1_payments import build_payments_router
+    rail = None
+    if settings.razorpay_key_id and settings.razorpay_key_secret and settings.razorpay_webhook_secret:
+        rail = RazorpayRail(RazorpayHttpGateway(settings.razorpay_key_id, settings.razorpay_key_secret), settings.razorpay_webhook_secret)
+    app.state.payment_rail = rail
+    app.state.plans = None
+    if rail is not None and settings.razorpay_plan_starter and settings.razorpay_plan_business:
+        from .plans import PlansService
+
+        app.state.plans = PlansService(rail.gateway, {"starter": settings.razorpay_plan_starter, "business": settings.razorpay_plan_business})
+        rail.on_subscription_event = app.state.plans.sync_subscription
+    app.include_router(build_payments_router(engine, rail))
+
+    from .invoices import Party
+    from .v1_invoices import build_invoices_router
+    from .v1_internal import build_internal_router
+    from .v1_privacy import build_privacy_router
+
+    app.include_router(build_internal_router(engine, settings.internal_token, rail))
+    from .v1_jobs import build_jobs_router, coordinator_poster
+
+    app.state.coordinator_post = coordinator_poster(settings.coordinator_url, settings.coordinator_token)  # tests replace this
+    app.include_router(build_jobs_router(engine, principal, lambda *a: app.state.coordinator_post(*a)))
+
+    app.include_router(build_invoices_router(engine, principal, seller=Party(settings.seller_name, (), settings.seller_gstin or None), test_mode=settings.invoice_test_mode))
+
+    def export_payments(session, user_id, org_ids):
+        from sqlalchemy import select
+
+        rows = session.scalars(select(payments.PaymentOrder).where(payments.PaymentOrder.org_id.in_(org_ids or [""])).order_by(payments.PaymentOrder.created_at))
+        return [{"order_id": o.id, "team": o.org_id, "amount_paise": o.amount_paise, "currency": o.currency, "status": o.status, "terms_hash": o.terms_hash, "created_at": o.created_at.isoformat()} for o in rows]
+
+    def export_plans(session, user_id, org_ids):
+        from sqlalchemy import select
+
+        rows = session.scalars(select(plans.TeamPlan).where(plans.TeamPlan.org_id.in_(org_ids or [""])))
+        return [{"team": r.org_id, "plan": r.plan, "status": r.status, "period_end": r.period_end.isoformat() if r.period_end else None} for r in rows]
+
+    def erase_plans(session, org_id):
+        """An erased team stops being billed: its subscription is cancelled at the end of the paid period, and its plan rows go.
+        Payment orders and invoices stay (the law requires it) and hold no names or emails."""
+        from sqlalchemy import delete, select
+
+        row = session.scalar(select(plans.TeamPlan).where(plans.TeamPlan.org_id == org_id))
+        if row is not None and row.status == plans.ACTIVE and row.subscription_id and app.state.plans is not None:
+            app.state.plans.gateway.cancel_subscription(row.subscription_id, at_cycle_end=True)
+        session.execute(delete(plans.PlanUsage).where(plans.PlanUsage.org_id == org_id))
+        session.execute(delete(plans.TeamPlan).where(plans.TeamPlan.org_id == org_id))
+
+    app.include_router(build_privacy_router(engine, principal, exporters={"payments": export_payments, "plans": export_plans}, org_erasers=[erase_plans]))
     @app.exception_handler(AccountError)
     async def account_refused(_: Request, exc: AccountError):
         return error(exc)
