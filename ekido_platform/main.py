@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     seller_name: str = "Ekido (test)"
     seller_gstin: str = ""
     invoice_test_mode: bool = True
+    # Shared secret for the Coordinator-only routes under /internal (erasure tasks, settle and refund). Empty keeps them closed (404).
+    internal_token: str = ""
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -112,7 +114,14 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
 
     from .invoices import Party
     from .v1_invoices import build_invoices_router
+    from .v1_internal import build_internal_router
     from .v1_privacy import build_privacy_router
+
+    app.include_router(build_internal_router(engine, settings.internal_token, rail))
+    from .v1_jobs import build_jobs_router, coordinator_poster
+
+    app.state.coordinator_post = coordinator_poster(settings.coordinator_url, settings.coordinator_token)  # tests replace this
+    app.include_router(build_jobs_router(engine, principal, lambda *a: app.state.coordinator_post(*a)))
 
     app.include_router(build_invoices_router(engine, principal, seller=Party(settings.seller_name, (), settings.seller_gstin or None), test_mode=settings.invoice_test_mode))
 
