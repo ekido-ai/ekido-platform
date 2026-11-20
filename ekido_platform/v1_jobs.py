@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -34,10 +34,14 @@ CoordinatorPost = Callable[[str, str, dict | None], tuple[int, Any]]
 
 
 class StartJob(BaseModel):
+    """Either `{quote_id}` (the contract: the Platform builds the job from what was quoted and paid for), or the older
+    `{order_id, workload, policy}`, where the workload is checked against the quote."""
+
     model_config = ConfigDict(extra="forbid")
-    order_id: str = Field(min_length=1, max_length=36)
-    workload: dict[str, Any]
-    policy: dict[str, Any]
+    order_id: str | None = Field(default=None, min_length=1, max_length=36)
+    quote_id: str | None = Field(default=None, min_length=1, max_length=36)
+    workload: dict[str, Any] | None = None
+    policy: dict[str, Any] | None = None
     deadline_seconds: int = Field(default=86_400, gt=0, le=7 * 24 * 3600)
 
 
@@ -50,9 +54,11 @@ def coordinator_poster(base_url: str, token: str, timeout: float = 20.0) -> Coor
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
-    def call(method: str, path: str, body: dict | None) -> tuple[int, Any]:
-        request = urllib.request.Request(base_url.rstrip("/") + path, method=method, data=json.dumps(body).encode() if body is not None else b"")
-        request.add_header("Content-Type", "application/json")
+    def call(method: str, path: str, body: dict | bytes | None) -> tuple[int, Any]:
+        raw_body = isinstance(body, bytes)  # a dataset upload: the exact bytes, not JSON
+        data = body if raw_body else (json.dumps(body).encode() if body is not None else b"")
+        request = urllib.request.Request(base_url.rstrip("/") + path, method=method, data=data)
+        request.add_header("Content-Type", "application/octet-stream" if raw_body else "application/json")
         if token:
             request.add_header("Authorization", f"Bearer {token}")
         try:
@@ -130,14 +136,36 @@ def build_jobs_router(engine: Engine, principal: Callable, coordinator: Coordina
     @router.post("/orgs/{org_id}/jobs", status_code=201)
     def start_job(org_id: str, body: StartJob, who: Principal = Depends(principal), session: Session = Depends(db)) -> dict[str, Any]:
         accounts.require_role(session, who, org_id, "owner", "admin")
-        order = session.get(PaymentOrder, body.order_id)
+        if (body.order_id is None) == (body.quote_id is None):
+            raise AccountError("BAD_REQUEST", "Send a quote_id (or an order_id with its workload and policy).", 422)
+        if body.quote_id is not None:
+            order = session.scalar(select(PaymentOrder).where(PaymentOrder.quote_id == body.quote_id, PaymentOrder.org_id == org_id)
+                                   .order_by((PaymentOrder.status == HELD).desc(), PaymentOrder.created_at.desc()))
+            if order is None:
+                raise AccountError("NOT_PAID", "This quote hasn't been paid for yet.", 402)
+        else:
+            order = session.get(PaymentOrder, body.order_id)
         if order is None or order.org_id != org_id:
             raise AccountError("NOT_FOUND", "No such order.", 404)
         if order.status != HELD:
-            raise AccountError("NOT_PAID", f"This order is {order.status}, so no job can start from it.", 409)
+            raise AccountError("NOT_PAID", f"This order is {order.status}, so no job can start from it.", 402 if body.quote_id else 409)
         if is_stale_claim(order.job_id):  # a request that died after claiming left this behind; let the customer try again
             release(session, order.id, order.job_id)
-        problems = workload_problems(order.quote, body.workload)
+        dataset_blob: tuple[str, bytes] | None = None
+        if body.quote_id is not None:
+            from .v1_datasets import Dataset, Quote, recipe_job
+
+            quote_row = session.get(Quote, order.quote_id)
+            dataset = session.get(Dataset, quote_row.dataset_id) if quote_row is not None else None
+            if dataset is None:
+                raise AccountError("NOT_FOUND", "The data for this quote is gone.", 404)
+            workload, policy = recipe_job(order.quote, dataset)
+            dataset_blob = (dataset.sha256, dataset.content)
+        else:
+            if body.workload is None or body.policy is None:
+                raise AccountError("BAD_REQUEST", "An order_id needs its workload and policy.", 422)
+            workload, policy = body.workload, body.policy
+        problems = workload_problems(order.quote, workload)
         if problems:
             raise AccountError("WORKLOAD_MISMATCH", "This is not what was paid for: " + "; ".join(problems) + ".", 422)
         claim = claim_marker()
@@ -147,7 +175,12 @@ def build_jobs_router(engine: Engine, principal: Callable, coordinator: Coordina
             raise AccountError("ALREADY_STARTED", "A job has already been started from this order.", 409)
         budget = (Decimal(order.quote["provider_budget_paise"]) / 100).quantize(Decimal("0.000001"))
         try:
-            status, created = coordinator("POST", "/jobs", {"workload": body.workload, "policy": body.policy, "budget_usdc": str(budget), "deadline_seconds": body.deadline_seconds})
+            if dataset_blob is not None:
+                # The providers fetch the rows by hash from the Coordinator's store; it re-checks the hash on write.
+                status, stored = coordinator("PUT", f"/datasets/{dataset_blob[0]}", dataset_blob[1])
+                if status not in (200, 201):
+                    raise AccountError("JOB_REFUSED", "The training data could not be handed over: " + _reason(stored), 502)
+            status, created = coordinator("POST", "/jobs", {"workload": workload, "policy": policy, "budget_usdc": str(budget), "deadline_seconds": body.deadline_seconds})
             if status != 200 and status != 201 or not isinstance(created, dict) or not created.get("job_id"):
                 raise AccountError("JOB_REFUSED", "The job could not be created: " + _reason(created), 422 if status in (400, 422) else 502)
             job_id = created["job_id"]

@@ -80,7 +80,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
     engine = engine or create_engine_for(settings.database_url)
     # SQLite (tests): create the tables. Postgres: the schema belongs to the migrations in apps/platform/alembic,
     # which the service unit runs before it starts.
-    from . import payments, plans, privacy, v1_admin, v1_invoices  # noqa: F401  (register their tables before create_all)
+    from . import payments, plans, privacy, v1_admin, v1_datasets, v1_invoices  # noqa: F401  (register their tables before create_all)
 
     if engine.dialect.name == "sqlite":
         Base.metadata.create_all(engine)
@@ -137,6 +137,11 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
 
     app.state.coordinator_post = coordinator_poster(settings.coordinator_url, settings.coordinator_token)  # tests replace this
     app.include_router(build_jobs_router(engine, principal, lambda *a: app.state.coordinator_post(*a)))
+    from .v1_datasets import build_datasets_router
+
+    # Ticket C9: recipes, datasets, quotes and orders. The rail and key id are read per request (tests set the rail).
+    app.include_router(build_datasets_router(engine, principal, payment_rail=lambda: getattr(app.state, "payment_rail", None),
+                                             razorpay_key_id=lambda: settings.razorpay_key_id if getattr(app.state, "payment_rail", None) else ""))
 
     app.include_router(build_invoices_router(engine, principal, seller=Party(settings.seller_name, (), settings.seller_gstin or None), test_mode=settings.invoice_test_mode))
 
