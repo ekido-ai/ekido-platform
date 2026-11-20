@@ -66,7 +66,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     engine = engine or create_engine_for(settings.database_url)
     # SQLite (tests): create the tables. Postgres: the schema belongs to the migrations in apps/platform/alembic,
     # which the service unit runs before it starts.
-    from . import payments, plans, v1_admin  # noqa: F401  (register their tables before create_all)
+    from . import payments, plans, privacy, v1_admin  # noqa: F401  (register their tables before create_all)
 
     if engine.dialect.name == "sqlite":
         Base.metadata.create_all(engine)
@@ -106,6 +106,32 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         rail.on_subscription_event = app.state.plans.sync_subscription
     app.include_router(build_payments_router(engine, rail))
 
+    from .v1_privacy import build_privacy_router
+
+    def export_payments(session, user_id, org_ids):
+        from sqlalchemy import select
+
+        rows = session.scalars(select(payments.PaymentOrder).where(payments.PaymentOrder.org_id.in_(org_ids or [""])).order_by(payments.PaymentOrder.created_at))
+        return [{"order_id": o.id, "team": o.org_id, "amount_paise": o.amount_paise, "currency": o.currency, "status": o.status, "terms_hash": o.terms_hash, "created_at": o.created_at.isoformat()} for o in rows]
+
+    def export_plans(session, user_id, org_ids):
+        from sqlalchemy import select
+
+        rows = session.scalars(select(plans.TeamPlan).where(plans.TeamPlan.org_id.in_(org_ids or [""])))
+        return [{"team": r.org_id, "plan": r.plan, "status": r.status, "period_end": r.period_end.isoformat() if r.period_end else None} for r in rows]
+
+    def erase_plans(session, org_id):
+        """An erased team stops being billed: its subscription is cancelled at the end of the paid period, and its plan rows go.
+        Payment orders and invoices stay (the law requires it) and hold no names or emails."""
+        from sqlalchemy import delete, select
+
+        row = session.scalar(select(plans.TeamPlan).where(plans.TeamPlan.org_id == org_id))
+        if row is not None and row.status == plans.ACTIVE and row.subscription_id and app.state.plans is not None:
+            app.state.plans.gateway.cancel_subscription(row.subscription_id, at_cycle_end=True)
+        session.execute(delete(plans.PlanUsage).where(plans.PlanUsage.org_id == org_id))
+        session.execute(delete(plans.TeamPlan).where(plans.TeamPlan.org_id == org_id))
+
+    app.include_router(build_privacy_router(engine, principal, exporters={"payments": export_payments, "plans": export_plans}, org_erasers=[erase_plans]))
     @app.exception_handler(AccountError)
     async def account_refused(_: Request, exc: AccountError):
         return error(exc)
