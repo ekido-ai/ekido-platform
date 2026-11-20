@@ -100,6 +100,12 @@ def build_internal_router(engine: Engine, internal_token: str, rail: RazorpayRai
         session.commit()
         return {"order_id": order.id, "job_id": order.job_id}
 
+    @router.get("/payments/jobs/{job_id}", dependencies=[Depends(guard)])
+    def job_order(job_id: str, session: Session = Depends(db)) -> dict[str, Any]:
+        """What the Coordinator needs to split a paid order: the status and the whole-paise budget for providers."""
+        order = order_for_job(session, job_id)
+        return {"order_id": order.id, "status": order.status, "provider_budget_paise": order.quote["provider_budget_paise"]}
+
     @router.post("/payments/jobs/{job_id}/settle", dependencies=[Depends(guard)])
     def settle(job_id: str, body: Settle, session: Session = Depends(db)) -> dict[str, Any]:
         order = order_for_job(session, job_id)

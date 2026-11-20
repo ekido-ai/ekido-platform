@@ -126,6 +126,12 @@ class Payments(Base):
         self.assertEqual(self.client.post("/internal/payments/orders/missing/job", headers=H, json={"job_id": "j"}).status_code, 404)
         self.assertEqual(self.client.post(f"/internal/payments/orders/{created}/job", headers=H, json={"job_id": "j", "x": 1}).status_code, 422)
 
+    def test_the_coordinator_can_read_the_budget_it_must_split(self):
+        order_id, q = self.order(job_id="job-1")
+        self.assertEqual(self.client.get("/internal/payments/jobs/job-1", headers=H).json(), {"order_id": order_id, "status": "HELD", "provider_budget_paise": q["provider_budget_paise"]})
+        self.assertEqual(self.client.get("/internal/payments/jobs/nobody", headers=H).status_code, 404)
+        self.assertEqual(self.client.get("/internal/payments/jobs/job-1").status_code, 404)
+
     def test_a_job_that_passes_settles_its_order_and_repeating_is_safe(self):
         order_id, q = self.order(job_id="job-1")
         split = {"provider-a": q["provider_budget_paise"] // 3, "provider-b": q["provider_budget_paise"] - q["provider_budget_paise"] // 3}
