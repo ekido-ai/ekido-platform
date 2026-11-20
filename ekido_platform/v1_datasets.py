@@ -45,7 +45,7 @@ class Dataset(Timestamped, Base):
     """Cleaned rows for one recipe, as the exact bytes a provider trains on."""
 
     __tablename__ = "datasets"
-    org_id: Mapped[str] = mapped_column(ForeignKey("orgs.id"), index=True)
+    org_id: Mapped[str] = mapped_column(String(36), ForeignKey("orgs.id"), index=True)
     recipe_id: Mapped[str] = mapped_column(String(64))
     sha256: Mapped[str] = mapped_column(String(64), index=True)
     bytes: Mapped[int] = mapped_column(Integer)
@@ -60,8 +60,8 @@ class Quote(Base):
 
     __tablename__ = "quotes"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    org_id: Mapped[str] = mapped_column(ForeignKey("orgs.id"), index=True)
-    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"))
+    org_id: Mapped[str] = mapped_column(String(36), ForeignKey("orgs.id"), index=True)
+    dataset_id: Mapped[str] = mapped_column(String(36), ForeignKey("datasets.id"))
     terms_hash: Mapped[str] = mapped_column(String(64), unique=True)
     quote: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
