@@ -72,7 +72,9 @@ def coordinator_client(base_url: str, token: str, timeout: float = 10.0) -> Coor
     return call
 
 
-def build_admin_router(engine: Engine, principal: Callable, admin_emails: list[str], coordinator: CoordinatorCall) -> APIRouter:
+def build_admin_router(engine: Engine, principal: Callable, admin_emails: list[str], coordinator: CoordinatorCall,
+                       payment_rail: Callable[[], Any] = lambda: None) -> APIRouter:
+    """`payment_rail` returns the Razorpay rail (or None when payments aren't configured); it's read per request."""
     router = APIRouter(prefix="/v1/admin")
     allowed = {accounts.normalise_email(e) for e in admin_emails if e.strip()}
 
@@ -151,6 +153,44 @@ def build_admin_router(engine: Engine, principal: Callable, admin_emails: list[s
             detail = body.get("detail") if isinstance(body, dict) else None
             raise AccountError("CANCEL_REFUSED", str(detail or f"The Coordinator refused ({status})."), 409)
         return body
+
+    @router.get("/orders")
+    def orders(who: tuple[str, str] = Depends(admin), session: Session = Depends(db)) -> list[dict[str, Any]]:
+        """Paid and unpaid orders, newest first, with the team's name."""
+        from .payments import PaymentOrder
+
+        names = dict(session.execute(select(Org.id, Org.name)).all())
+        rows = session.scalars(select(PaymentOrder).order_by(PaymentOrder.created_at.desc()).limit(200))
+        return [{"order_id": o.id, "org_id": o.org_id, "team": names.get(o.org_id), "amount_paise": o.amount_paise, "currency": o.currency,
+                 "status": o.status, "job_id": o.job_id, "created_at": o.created_at.isoformat() if o.created_at else None} for o in rows]
+
+    @router.post("/orders/{order_id}/refund")
+    def refund(order_id: str, who: tuple[str, str] = Depends(admin), session: Session = Depends(db)) -> dict[str, Any]:
+        """Refund a paid order in full (test mode: the rail refuses live keys). Only an order still held can be refunded;
+        every attempt, refused or not, is written to the audit log."""
+        from .payments import PaymentError, PaymentOrder
+
+        rail = payment_rail()
+        if rail is None:
+            log(session, who, "order.refund", order_id, "unavailable", {})
+            raise AccountError("PAYMENTS_UNAVAILABLE", "Payments aren't set up on this server, so nothing was refunded.", 503)
+        if session.get(PaymentOrder, order_id) is None:
+            raise AccountError("NOT_FOUND", "No such order.", 404)
+        try:
+            order = rail.refund(session, order_id, "refunded from the admin area")
+        except PaymentError as exc:
+            session.rollback()
+            if exc.status >= 500:  # Razorpay unreachable or answered strangely: the order stays held, try again
+                log(session, who, "order.refund", order_id, "unreachable", {"code": exc.code})
+                raise AccountError("GATEWAY_UNAVAILABLE", "Razorpay didn't answer; nothing was refunded. Try again.", 503) from None
+            log(session, who, "order.refund", order_id, "refused", {"code": exc.code})
+            raise AccountError("REFUND_REFUSED", exc.detail, 409) from None
+        except OSError:
+            session.rollback()
+            log(session, who, "order.refund", order_id, "unreachable", {})
+            raise AccountError("GATEWAY_UNAVAILABLE", "Razorpay didn't answer; nothing was refunded. Try again.", 503) from None
+        log(session, who, "order.refund", order_id, "done", {"amount_paise": order.amount_paise, "status": order.status})
+        return {"order_id": order.id, "status": order.status, "amount_paise": order.amount_paise}
 
     @router.get("/audit")
     def audit(who: tuple[str, str] = Depends(admin), session: Session = Depends(db)) -> list[dict[str, Any]]:

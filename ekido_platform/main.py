@@ -106,7 +106,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
     from .v1_savings import build_savings_router
     app.include_router(build_savings_router(engine, principal, settings.savings_evidence_root))
     app.include_router(v1_admin.build_admin_router(engine, principal, settings.admin_emails,
-                                                   v1_admin.coordinator_client(settings.coordinator_url, settings.coordinator_token)))
+                                                   v1_admin.coordinator_client(settings.coordinator_url, settings.coordinator_token),
+                                                   payment_rail=lambda: getattr(app.state, "payment_rail", None)))
 
     from .v1_assistant import build_assistant_router
     app.include_router(build_assistant_router(engine, principal, settings.assistant_engine_url,
