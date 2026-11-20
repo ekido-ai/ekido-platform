@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     inference_rate_per_minute: int = 60
     # Operator-managed evidence and per-model manifests; empty disables savings reports.
     savings_evidence_root: str = ""
+    assistant_engine_url: str = ""
+    assistant_state_secret: str = ""
+    assistant_datasets_root: str = ""
     # Emails allowed into the owner's admin area (ticket C26). Empty keeps it closed to everyone.
     admin_emails: list[str] = []
     # Razorpay, test mode only (ticket C7). The key id is public; the secret and the webhook secret come from the environment
@@ -72,7 +75,7 @@ def create_engine_for(database_url: str) -> Engine:
     return create_engine(database_url, pool_pre_ping=True)
 
 
-def create_app(settings: Settings | None = None, engine: Engine | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, engine: Engine | None = None, *, assistant_transport=None) -> FastAPI:
     settings = settings or Settings()
     engine = engine or create_engine_for(settings.database_url)
     # SQLite (tests): create the tables. Postgres: the schema belongs to the migrations in apps/platform/alembic,
@@ -104,6 +107,10 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     app.include_router(build_savings_router(engine, principal, settings.savings_evidence_root))
     app.include_router(v1_admin.build_admin_router(engine, principal, settings.admin_emails,
                                                    v1_admin.coordinator_client(settings.coordinator_url, settings.coordinator_token)))
+
+    from .v1_assistant import build_assistant_router
+    app.include_router(build_assistant_router(engine, principal, settings.assistant_engine_url,
+        settings.assistant_state_secret, settings.assistant_datasets_root, transport=assistant_transport))
 
     from .payments import RazorpayHttpGateway, RazorpayRail
     from .v1_payments import build_payments_router
