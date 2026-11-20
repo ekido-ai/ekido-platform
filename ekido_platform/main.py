@@ -118,6 +118,10 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     from .v1_privacy import build_privacy_router
 
     app.include_router(build_internal_router(engine, settings.internal_token, rail))
+    from .v1_jobs import build_jobs_router, coordinator_poster
+
+    app.state.coordinator_post = coordinator_poster(settings.coordinator_url, settings.coordinator_token)  # tests replace this
+    app.include_router(build_jobs_router(engine, principal, lambda *a: app.state.coordinator_post(*a)))
 
     app.include_router(build_invoices_router(engine, principal, seller=Party(settings.seller_name, (), settings.seller_gstin or None), test_mode=settings.invoice_test_mode))
 
