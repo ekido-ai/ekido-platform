@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     # The Razorpay plan ids for Starter and Business (created in the test-mode dashboard; ids are not secrets).
     razorpay_plan_starter: str = ""
     razorpay_plan_business: str = ""
+    # Invoices (C8): who issues them, and whether they are still "TEST INVOICE: not a tax invoice" (until the company has a GSTIN).
+    seller_name: str = "Ekido (test)"
+    seller_gstin: str = ""
+    invoice_test_mode: bool = True
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -66,7 +70,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     engine = engine or create_engine_for(settings.database_url)
     # SQLite (tests): create the tables. Postgres: the schema belongs to the migrations in apps/platform/alembic,
     # which the service unit runs before it starts.
-    from . import payments, plans, privacy, v1_admin  # noqa: F401  (register their tables before create_all)
+    from . import payments, plans, privacy, v1_admin, v1_invoices  # noqa: F401  (register their tables before create_all)
 
     if engine.dialect.name == "sqlite":
         Base.metadata.create_all(engine)
@@ -106,7 +110,11 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
         rail.on_subscription_event = app.state.plans.sync_subscription
     app.include_router(build_payments_router(engine, rail))
 
+    from .invoices import Party
+    from .v1_invoices import build_invoices_router
     from .v1_privacy import build_privacy_router
+
+    app.include_router(build_invoices_router(engine, principal, seller=Party(settings.seller_name, (), settings.seller_gstin or None), test_mode=settings.invoice_test_mode))
 
     def export_payments(session, user_id, org_ids):
         from sqlalchemy import select
