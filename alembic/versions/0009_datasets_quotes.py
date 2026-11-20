@@ -16,14 +16,14 @@ def upgrade() -> None:
     op.create_table(
         'datasets',
         sa.Column('id', sa.String(36), primary_key=True),
-        sa.Column('created_at', sa.DateTime(timezone=True)),
+        sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
         sa.Column('org_id', sa.String(36), sa.ForeignKey('orgs.id'), nullable=False),
         sa.Column('recipe_id', sa.String(64), nullable=False),
         sa.Column('sha256', sa.String(64), nullable=False),
         sa.Column('bytes', sa.Integer, nullable=False),
         sa.Column('train_rows', sa.Integer, nullable=False),
         sa.Column('test_rows', sa.Integer, nullable=False),
-        sa.Column('redactions', sa.JSON),
+        sa.Column('redactions', sa.JSON, nullable=False),
         sa.Column('content', sa.LargeBinary, nullable=False),
     )
     op.create_index('ix_datasets_org_id', 'datasets', ['org_id'])
@@ -35,7 +35,7 @@ def upgrade() -> None:
         sa.Column('dataset_id', sa.String(36), sa.ForeignKey('datasets.id'), nullable=False),
         sa.Column('terms_hash', sa.String(64), nullable=False, unique=True),
         sa.Column('quote', sa.JSON, nullable=False),
-        sa.Column('created_at', sa.DateTime(timezone=True)),
+        sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     )
     op.create_index('ix_quotes_org_id', 'quotes', ['org_id'])
 
