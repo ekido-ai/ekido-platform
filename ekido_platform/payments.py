@@ -64,6 +64,7 @@ class PaymentOrder(Timestamped, Base):
     currency: Mapped[str] = mapped_column(String(3), default="INR")
     gateway_order_id: Mapped[str] = mapped_column(String(64), unique=True)
     gateway_payment_id: Mapped[str | None] = mapped_column(String(64), unique=True)
+    job_id: Mapped[str | None] = mapped_column(String(36), unique=True)  # the Coordinator job started from this paid order
     status: Mapped[str] = mapped_column(String(24), default=CREATED)
     failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
     quote: Mapped[dict] = mapped_column(JSON)
