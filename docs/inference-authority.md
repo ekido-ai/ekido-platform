@@ -32,11 +32,20 @@ and the trusted engine location. The default limit is 60 requests per minute;
 `INFERENCE_RATE_PER_MINUTE` changes it. Use Postgres in deployment: the database
 row lock is required for concurrent requests across processes.
 
-After each reservation, the router reports `ok` with actual input/output token
-counts, or `error`, and latency to `/internal/inference/usage/{reservation_id}`.
-Reservations can be finalized once. Pending rows record incomplete requests
-and must be reconciled after router failures; no prompt, response, or key is
-stored in usage. Billing and automatic reconciliation are not implemented here.
+For a successful batch, the router sends all reservation IDs and their actual
+input/output token counts and latency to `/internal/inference/usage-batch`.
+The authority locks the rows in ID order and validates the whole batch before
+finalizing it in one database transaction. Every reservation must belong to
+the same key and model. An exact replay of an already finalized batch succeeds
+without changing it; a different replay or a mixture of pending and finished
+rows is refused. Deploy this Platform endpoint before a gateway that requires it.
+
+For errors, the existing `/internal/inference/usage/{reservation_id}` endpoint
+records `error` and latency per reservation. Pending rows record incomplete
+requests and must be reconciled after router failures; no prompt, response, or
+key is stored in usage. A lost response after a committed batch can still leave
+the router uncertain whether usage was recorded, even with idempotent retries.
+Billing and automatic reconciliation are not implemented here.
 
 This authority is only one part of the gateway: a router must still authenticate
 its connection to this service, enforce a bounded request size and queue, call the
