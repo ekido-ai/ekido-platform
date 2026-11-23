@@ -41,6 +41,19 @@ class Finish(BaseModel):
     latency_ms: int = Field(ge=0, le=2_147_483_647)
 
 
+class BatchUsageItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    reservation_id: str = Field(min_length=36, max_length=36)
+    input_tokens: int = Field(ge=0, le=2_147_483_647)
+    output_tokens: int = Field(ge=0, le=2_147_483_647)
+    latency_ms: int = Field(ge=0, le=2_147_483_647)
+
+
+class FinishBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    items: list[BatchUsageItem] = Field(min_length=1, max_length=32)
+
+
 def model_manifest(root: Path, model_id: str) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", model_id):
         raise ValueError("invalid model id")
@@ -129,6 +142,35 @@ def build_inference_authority(engine: Engine, model_root: str, internal_token: s
             key.last_used_at = now
         return {"reservation_id": reservation_id, "engine_url": manifest["engine_url"],
                 "engine_model": manifest["engine_model"]}
+
+    @router.post("/usage-batch", dependencies=[Depends(internal)])
+    def finish_batch(body: FinishBatch) -> dict:
+        items = {item.reservation_id: item for item in body.items}
+        if len(items) != len(body.items):
+            raise AccountError("INVALID_USAGE", "Duplicate reservations are not allowed.", 422)
+        try:
+            if any(str(uuid.UUID(item_id)) != item_id for item_id in items):
+                raise ValueError("noncanonical UUID")
+        except ValueError:
+            raise AccountError("INVALID_USAGE", "Invalid reservation ID.", 422) from None
+        with Session(engine) as session, session.begin():
+            rows = list(session.scalars(select(InferenceUsage).where(InferenceUsage.id.in_(items))
+                                        .order_by(InferenceUsage.id).with_for_update()))
+            if len(rows) != len(items):
+                raise AccountError("NOT_FOUND", "No such reservation.", 404)
+            if len({(row.key_id, row.model_id) for row in rows}) != 1:
+                raise AccountError("INVALID_USAGE", "Reservations must share a key and model.", 422)
+            if all(row.status == "ok" and row.input_tokens == items[row.id].input_tokens
+                   and row.output_tokens == items[row.id].output_tokens
+                   and row.latency_ms == items[row.id].latency_ms for row in rows):
+                return {"ok": True}  # Exact replay after a lost response.
+            if any(row.status != "pending" for row in rows):
+                raise AccountError("ALREADY_FINISHED", "Reservation was already finalized.", 409)
+            for row in rows:
+                item = items[row.id]
+                row.status, row.input_tokens = "ok", item.input_tokens
+                row.output_tokens, row.latency_ms = item.output_tokens, item.latency_ms
+        return {"ok": True}
 
     @router.post("/usage/{reservation_id}", dependencies=[Depends(internal)])
     def finish(reservation_id: str, body: Finish) -> dict:

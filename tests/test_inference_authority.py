@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, delete, select
+from sqlalchemy import create_engine, delete, event, select
 from sqlalchemy.orm import Session
 
 from ekido_platform import accounts
@@ -96,6 +96,65 @@ class InferenceAuthority(unittest.TestCase):
         self.write_manifest()
         self.assertEqual(self.reserve(key=self.live_key).status_code, 200)
 
+    def test_batch_finalization_is_atomic_and_exact_retry_is_idempotent(self):
+        first, second = self.reserve().json()['reservation_id'], self.reserve().json()['reservation_id']
+        url = '/internal/inference/usage-batch'
+        items = [{'reservation_id': first, 'input_tokens': 3, 'output_tokens': 2, 'latency_ms': 5},
+                 {'reservation_id': second, 'input_tokens': 6, 'output_tokens': 4, 'latency_ms': 9}]
+        self.assertEqual(self.client.post(url, json={'items': items}).status_code, 401)
+        missing = [items[0], {**items[1], 'reservation_id': str(uuid.uuid4())}]
+        self.assertEqual(self.client.post(url, headers=self.headers, json={'items': missing}).status_code, 404)
+        self.assertEqual(self.client.post(url, headers=self.headers, json={'items': [items[0], items[0]]}).status_code, 422)
+        self.assertEqual(self.client.post(url, headers=self.headers, json={'items': []}).status_code, 422)
+        self.assertEqual(self.client.post(url, headers=self.headers,
+            json={'items': [items[0], {**items[1], 'input_tokens': '3'}]}).status_code, 422)
+        self.assertEqual(self.client.post(url, headers=self.headers,
+            json={'items': [items[0], {**items[1], 'reservation_id': 'z' * 36}]}).status_code, 422)
+        with Session(self.app.state.engine) as session:
+            self.assertEqual([session.get(InferenceUsage, i).status for i in (first, second)], ['pending', 'pending'])
+        self.assertEqual(self.client.post(url, headers=self.headers, json={'items': items}).status_code, 200)
+        self.assertEqual(self.client.post(url, headers=self.headers, json={'items': items[::-1]}).status_code, 200)
+        different = [items[0], {**items[1], 'input_tokens': 7}]
+        self.assertEqual(self.client.post(url, headers=self.headers, json={'items': different}).status_code, 409)
+        with Session(self.app.state.engine) as session:
+            self.assertEqual([(session.get(InferenceUsage, i).status, session.get(InferenceUsage, i).input_tokens)
+                              for i in (first, second)], [('ok', 3), ('ok', 6)])
+
+    def test_batch_rejects_finished_or_mixed_keys_without_partial_success(self):
+        first, second = self.reserve().json()['reservation_id'], self.reserve().json()['reservation_id']
+        url = '/internal/inference/usage-batch'
+        items = [{'reservation_id': i, 'input_tokens': 1, 'output_tokens': 2, 'latency_ms': 3}
+                 for i in (first, second)]
+        self.assertEqual(self.client.post(f'/internal/inference/usage/{second}', headers=self.headers,
+            json={'status': 'error', 'latency_ms': 1}).status_code, 200)
+        self.assertEqual(self.client.post(url, headers=self.headers, json={'items': items}).status_code, 409)
+        with Session(self.app.state.engine) as session:
+            self.assertEqual(session.get(InferenceUsage, first).status, 'pending')
+            # Simulate a differently owned reservation without relying on a second model.
+            row = session.get(InferenceUsage, second)
+            row.status = 'pending'
+            row.key_id = session.scalar(select(accounts.ApiKey.id).where(accounts.ApiKey.key_hash == accounts._hash(self.other_key)))
+            session.commit()
+        self.assertEqual(self.client.post(url, headers=self.headers, json={'items': items}).status_code, 422)
+        with Session(self.app.state.engine) as session:
+            self.assertEqual([session.get(InferenceUsage, i).status for i in (first, second)], ['pending', 'pending'])
+
+    def test_batch_rolls_back_when_commit_fails(self):
+        first, second = self.reserve().json()['reservation_id'], self.reserve().json()['reservation_id']
+        items = [{'reservation_id': i, 'input_tokens': 1, 'output_tokens': 2, 'latency_ms': 3}
+                 for i in (first, second)]
+        def fail_flush(session, _context, _instances):
+            if any(isinstance(row, InferenceUsage) and row.status == 'ok' for row in session.dirty):
+                raise RuntimeError('simulated database failure')
+        event.listen(Session, 'before_flush', fail_flush)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'simulated database failure'):
+                self.client.post('/internal/inference/usage-batch', headers=self.headers, json={'items': items})
+        finally:
+            event.remove(Session, 'before_flush', fail_flush)
+        with Session(self.app.state.engine) as session:
+            self.assertEqual([session.get(InferenceUsage, i).status for i in (first, second)], ['pending', 'pending'])
+
     def test_untrusted_or_malformed_manifest_is_not_routed(self):
         for url in ('http://example.com:80', 'http://10.0.0.1:1234', 'http://127.0.0.1:1234/x',
                     'http://a:b@127.0.0.1:1234', 'https://127.0.0.1:1234'):
@@ -122,6 +181,49 @@ class InferenceAuthority(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('TEST_DATABASE_URL', '').startswith('postgresql'), 'requires migrated Postgres')
 class PostgresRateLimit(unittest.TestCase):
+    def test_concurrent_overlapping_batches_commit_without_partial_success(self):
+        engine = create_engine(os.environ['TEST_DATABASE_URL'])
+        self.addCleanup(engine.dispose)
+        email = f'{uuid.uuid4().hex}@example.com'
+        ids = [str(uuid.uuid4()) for _ in range(3)]
+        with Session(engine) as session:
+            user, _ = accounts.finish_login(session, accounts.start_login(session, email))
+            org = accounts.create_org(session, user.id, 'Atomic usage test')
+            key, _ = accounts.create_api_key(session, org.id, user.id, 'test', 'test', ['models.predict'])
+            session.flush()
+            key_id, org_id, user_id = key.id, org.id, user.id
+            for item in ids:
+                session.add(InferenceUsage(id=item, key_id=key_id, model_id='m', created_at=accounts.utcnow(), status='pending'))
+            session.commit()
+        def cleanup():
+            with Session(engine) as session, session.begin():
+                session.execute(delete(InferenceUsage).where(InferenceUsage.key_id == key_id))
+                session.execute(delete(accounts.ApiKey).where(accounts.ApiKey.id == key_id))
+                session.execute(delete(accounts.OrgMember).where(accounts.OrgMember.org_id == org_id))
+                session.execute(delete(accounts.WebSession).where(accounts.WebSession.user_id == user_id))
+                session.execute(delete(accounts.UserEmail).where(accounts.UserEmail.user_id == user_id))
+                session.execute(delete(accounts.LoginToken).where(accounts.LoginToken.email == email))
+                session.execute(delete(accounts.Org).where(accounts.Org.id == org_id))
+                session.execute(delete(accounts.User).where(accounts.User.id == user_id))
+        self.addCleanup(cleanup)
+        with tempfile.TemporaryDirectory() as temp:
+            token = 'concurrency-test-token-' + 'x' * 32
+            app = create_app(Settings(database_url=os.environ['TEST_DATABASE_URL'], _env_file=None,
+                inference_models_root=temp, inference_internal_token=token, inference_rate_per_minute=10), engine=engine)
+            barrier = threading.Barrier(2)
+            def call(batch):
+                items = [{'reservation_id': i, 'input_tokens': 1, 'output_tokens': 1, 'latency_ms': 1} for i in batch]
+                with TestClient(app) as client:
+                    barrier.wait(timeout=15)
+                    return client.post('/internal/inference/usage-batch', headers={'x-ekido-inference-token': token},
+                                       json={'items': items}).status_code
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                statuses = list(pool.map(call, ([ids[0], ids[1]], [ids[1], ids[2]])))
+            self.assertEqual(sorted(statuses), [200, 409])
+            with Session(engine) as session:
+                states = [session.get(InferenceUsage, i).status for i in ids]
+                self.assertIn(states, (['ok', 'ok', 'pending'], ['pending', 'ok', 'ok']))
+
     def test_concurrent_reservations_obey_limit(self):
         engine = create_engine(os.environ['TEST_DATABASE_URL'])
         self.addCleanup(engine.dispose)
