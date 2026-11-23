@@ -137,6 +137,12 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
 
     app.state.coordinator_post = coordinator_poster(settings.coordinator_url, settings.coordinator_token)  # tests replace this
     app.include_router(build_jobs_router(engine, principal, lambda *a: app.state.coordinator_post(*a)))
+    from .v1_customer_jobs import build_customer_jobs_router
+
+    # Ticket C12: the customer's own jobs and models, allow-listed so no device identity ever reaches them.
+    app.state.coordinator_get = v1_admin.coordinator_client(settings.coordinator_url, settings.coordinator_token)  # tests replace this
+    app.include_router(build_customer_jobs_router(engine, principal, lambda: app.state.coordinator_get,
+                                                  lambda: (settings.coordinator_url, settings.coordinator_token)))
     from .v1_datasets import build_datasets_router
 
     # Ticket C9: recipes, datasets, quotes and orders. The rail and key id are read per request (tests set the rail).
