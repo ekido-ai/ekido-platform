@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     # Operator-managed evidence and per-model manifests; empty disables savings reports.
     savings_evidence_root: str = ""
     assistant_engine_url: str = ""
+    # Qwen3Guard's engine (loopback). Required: without it the assistant answers 503.
+    assistant_guard_url: str = ""
     assistant_state_secret: str = ""
     assistant_datasets_root: str = ""
     # Emails allowed into the owner's admin area (ticket C26). Empty keeps it closed to everyone.
@@ -111,7 +113,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
 
     from .v1_assistant import build_assistant_router
     app.include_router(build_assistant_router(engine, principal, settings.assistant_engine_url,
-        settings.assistant_state_secret, settings.assistant_datasets_root, transport=assistant_transport))
+        settings.assistant_state_secret, settings.assistant_datasets_root, guard_url=settings.assistant_guard_url,
+        transport=assistant_transport))
 
     from .payments import RazorpayHttpGateway, RazorpayRail
     from .v1_payments import build_payments_router
