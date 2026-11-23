@@ -71,3 +71,24 @@ class AssistantModel:
             return content
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
             raise AssistantError('assistant engine is unavailable or returned invalid output') from None
+
+
+class GuardModel(AssistantModel):
+    """Qwen3Guard on its own llama.cpp engine. Its chat template holds the safety policy, so the request goes in alone,
+    as the user turn, and the answer is plain text (no JSON schema)."""
+
+    def classify(self, user_text: str) -> str:
+        payload = {'model': 'Qwen/Qwen3Guard-Gen-0.6B', 'temperature': 0, 'max_tokens': 64, 'stream': False,
+                   'messages': [{'role': 'user', 'content': user_text}]}
+        try:
+            with httpx.Client(trust_env=False, follow_redirects=False, timeout=60, transport=self.transport) as client:
+                response = client.post(self.origin + '/v1/chat/completions', json=payload)
+                response.raise_for_status()
+                if len(response.content) > 65_536:
+                    raise AssistantError('guard response is too large')
+                content = response.json()['choices'][0]['message']['content']
+            if not isinstance(content, str):
+                raise AssistantError('guard response is invalid')
+            return content
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
+            raise AssistantError('guard engine is unavailable or returned invalid output') from None

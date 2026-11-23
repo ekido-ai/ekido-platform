@@ -40,6 +40,26 @@ def structured_object(text: str, keys: set[str]) -> dict[str, Any]:
     return value
 
 
+GUARD_LABEL = re.compile(r'Safety: (Safe|Unsafe|Controversial)')
+GUARD_CATEGORIES = ('Violent', 'Non-violent Illegal Acts', 'Sexual Content or Sexual Acts', 'PII', 'Suicide & Self-Harm',
+                    'Unethical Acts', 'Politically Sensitive Topics', 'Copyright Violation', 'Jailbreak')
+
+
+def guard_decision(text: str) -> tuple[str, list[str]]:
+    """Qwen3Guard's verdict on a request: 'allow', 'review' (Controversial) or 'refuse' (Unsafe), with its categories.
+
+    The guard answers in plain text, a "Safety: Unsafe" line then a "Categories: Violent" line. Anything without
+    exactly one safety label is unreadable and fails closed, like every other assistant check.
+    """
+    if not isinstance(text, str) or len(text) > 2_000:
+        raise AssistantError('guard output is missing or too large')
+    labels = GUARD_LABEL.findall(text)
+    if len(labels) != 1:
+        raise AssistantError('guard output has no single safety label')
+    categories = [c for c in GUARD_CATEGORIES if c in text]
+    return {'Safe': 'allow', 'Controversial': 'review', 'Unsafe': 'refuse'}[labels[0]], categories
+
+
 def policy_decision(text: str) -> str:
     value = structured_object(text, {'decision'})['decision']
     if value not in ('allow', 'refuse', 'review'):

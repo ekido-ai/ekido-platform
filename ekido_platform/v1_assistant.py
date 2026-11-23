@@ -19,8 +19,8 @@ from sqlalchemy.orm import Session
 
 from . import accounts
 from .accounts import AccountError, Principal
-from .assistant import AssistantError, build_preview, policy_decision, task_decision
-from .assistant_model import AssistantModel, POLICY_SCHEMA, POLICY_SYSTEM, TASK_SCHEMA, TASK_SYSTEM
+from .assistant import AssistantError, build_preview, guard_decision, policy_decision, task_decision
+from .assistant_model import AssistantModel, GuardModel, POLICY_SCHEMA, POLICY_SYSTEM, TASK_SCHEMA, TASK_SYSTEM
 
 
 class Message(BaseModel):
@@ -104,18 +104,23 @@ def _dataset(root: Path | None, dataset_id: str, engine: Engine, who: Principal)
 
 
 def build_assistant_router(engine: Engine, principal: Callable, engine_url: str, state_secret: str,
-                           datasets_root: str, *, transport=None) -> APIRouter:
+                           datasets_root: str, *, guard_url: str = '', transport=None) -> APIRouter:
     router = APIRouter(prefix='/v1')
     root = Path(datasets_root).resolve() if datasets_root else None
     try:
         model = AssistantModel(engine_url, transport=transport) if engine_url else None
     except AssistantError:
         model = None
+    try:
+        guard = GuardModel(guard_url, transport=transport) if guard_url else None
+    except AssistantError:
+        guard = None
     permits = threading.BoundedSemaphore(2)
 
     @router.post('/assistant/messages')
     def message(body: Message, who: Principal = Depends(principal)) -> dict:
-        if model is None or len(state_secret) < 32:
+        # The guard is required: without it the assistant doesn't answer (fail closed, decision G1).
+        if model is None or guard is None or len(state_secret) < 32:
             raise AccountError('ASSISTANT_UNAVAILABLE', 'Assistant is not configured.', 503)
         if who.via == 'api_key' and 'jobs' not in who.scopes:
             raise AccountError('FORBIDDEN', 'The API key needs jobs scope.', 403)
@@ -126,7 +131,9 @@ def build_assistant_router(engine: Engine, principal: Callable, engine_url: str,
         if not permits.acquire(blocking=False):
             raise AccountError('ASSISTANT_BUSY', 'Assistant is busy. Try again.', 503)
         try:
-            decision = policy_decision(model.decide(POLICY_SYSTEM, body.message, POLICY_SCHEMA))
+            # 1. Qwen3Guard, a separate model trained for safety (decision G1). 2. Our own policy check. Both must allow.
+            screened, _ = guard_decision(guard.classify(body.message))
+            decision = screened if screened != 'allow' else policy_decision(model.decide(POLICY_SYSTEM, body.message, POLICY_SCHEMA))
             if decision != 'allow':
                 return {'conversation_id': _encode(state, state_secret), 'refused': decision,
                         'reply': 'This request cannot proceed without policy review.' if decision == 'review'
