@@ -33,12 +33,13 @@ import json
 import re
 import secrets
 import uuid
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import JSON, Integer, LargeBinary, String, delete, select, update
+from sqlalchemy import JSON, DateTime, Integer, LargeBinary, String, delete, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
@@ -46,7 +47,7 @@ from ekido_core.recipes import recipe
 
 from . import accounts
 from .accounts import AccountError, JobOwner, Principal
-from .models import Base, Timestamped
+from .models import Base, Timestamped, utcnow
 from .payments import HELD, PaymentError, PaymentOrder
 from .v1_datasets import Dataset, Quote, dataset_bytes, recipe_job, split_rows
 
@@ -69,6 +70,7 @@ class Distillation(Timestamped, Base):
     dataset_id: Mapped[str] = mapped_column(String(36))
     state: Mapped[str] = mapped_column(String(16), index=True)
     generation_job_id: Mapped[str | None] = mapped_column(String(36))
+    generating_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # when the current generation started; see `sweep_stuck_generations`
     generated: Mapped[bytes | None] = mapped_column(LargeBinary)  # generated.jsonl, exactly as the Coordinator stored it
     generated_rows: Mapped[int] = mapped_column(Integer, default=0)
     generated_sha256: Mapped[str | None] = mapped_column(String(64))
@@ -93,6 +95,11 @@ class RemoveBody(BaseModel):
 class GenerationFailed(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reason: str = Field(default="the generation job failed", max_length=200)
+
+
+class SweepBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    older_than_minutes: int = Field(default=360, ge=15, le=7 * 24 * 60)  # 6 hours unless told otherwise
 
 
 class Generated(BaseModel):
@@ -183,6 +190,40 @@ def _start_generation(session: Session, row: Distillation, quote: dict, dataset:
         detail = created.get("detail") if isinstance(created, dict) and isinstance(created.get("detail"), str) else "the service refused it"
         raise AccountError("GENERATION_REFUSED", "The example generation could not start: " + detail[:200], 422 if status in (400, 409, 422) else 502)
     row.generation_job_id = created["job_id"]
+    row.generating_since = utcnow()
+
+
+def sweep_stuck_generations(session: Session, rail, *, older_than: timedelta, now: datetime | None = None) -> dict[str, int]:
+    """For a timer. (1) Fail and refund every distillation that has been GENERATING for longer than `older_than`: the Coordinator never
+    reported, so the customer's money must not stay held for ever. (2) Retry the refund of any FAILED or REJECTED one whose order is still
+    held (an earlier refund failed). One refund that fails does not stop the others; it is counted in `refund_errors` and the next run retries it.
+    Safe to run twice."""
+    now = now or utcnow()
+    cutoff = now - older_than
+    failed = errors = 0
+    handled: set[str] = set()
+    for row in list(session.scalars(select(Distillation).where(Distillation.state == GENERATING))):
+        since = row.generating_since or row.created_at
+        since = since if since.tzinfo else since.replace(tzinfo=cutoff.tzinfo)
+        if since > cutoff:
+            continue
+        handled.add(row.id)
+        try:
+            fail_generation(session, row.id, "example generation took too long", rail)
+            failed += 1
+        except AccountError:
+            session.rollback()
+            failed += 1  # it is FAILED now (the state was saved before the refund); only the refund is outstanding
+            errors += 1
+    for row in list(session.scalars(select(Distillation).where(Distillation.state.in_((FAILED, REJECTED))))):
+        if row.id in handled:
+            continue  # just failed above; its refund was tried once in this run
+        try:
+            _ensure_refunded(session, row, rail)
+        except AccountError:
+            session.rollback()
+            errors += 1
+    return {"failed": failed, "refund_errors": errors}
 
 
 def accept_rows(session: Session, distillation_id: str, body: Generated, rail) -> Distillation:
@@ -323,6 +364,7 @@ def build_distill_router(engine: Engine, principal: Callable, coordinator: Coord
             session.rollback()
             raise
         row.state, row.generated, row.generated_rows, row.generated_sha256, row.sample, row.removed = GENERATING, None, 0, None, [], []
+        row.generating_since = utcnow()
         session.commit()
         return view(row)
 

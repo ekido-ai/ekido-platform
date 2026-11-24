@@ -113,6 +113,13 @@ def build_internal_router(engine: Engine, internal_token: str, rail: RazorpayRai
         row = v1_distill.fail_generation(session, distillation_id, body.reason, rail)
         return {"distillation_id": row.id, "state": row.state}
 
+    @router.post("/distillations/sweep", dependencies=[Depends(guard)])
+    def distillation_sweep(body: v1_distill.SweepBody | None = None, session: Session = Depends(db)) -> dict[str, Any]:
+        """For a timer: fail and refund every distillation whose example generation has run longer than `older_than_minutes` (default 6 hours)."""
+        from datetime import timedelta
+
+        return v1_distill.sweep_stuck_generations(session, rail, older_than=timedelta(minutes=(body or v1_distill.SweepBody()).older_than_minutes))
+
     @router.get("/payments/jobs/{job_id}", dependencies=[Depends(guard)])
     def job_order(job_id: str, session: Session = Depends(db)) -> dict[str, Any]:
         """What the Coordinator needs to split a paid order: the status and the whole-paise budget for providers."""

@@ -315,6 +315,76 @@ class WhenGenerationEnds(Base):
         self.assertEqual(c.post(f"/internal/distillations/{did}/failed", json={}, headers={"X-Internal-Token": "wrong"}).status_code, 404)
 
 
+class Sweeping(Base):
+    def age(self, did, minutes):
+        from datetime import datetime, timedelta, timezone
+
+        with Session(self.engine) as s:
+            s.get(Distillation, did).generating_since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+            s.commit()
+
+    def sweep(self, body=None, headers=H):
+        return self.client("asha@example.com").post("/internal/distillations/sweep", headers=headers, **({"json": body} if body is not None else {}))
+
+    def test_a_generation_that_never_reported_is_failed_and_refunded_after_six_hours_and_not_before(self):
+        order_id, quote = self.paid_order()
+        did = self.start(order_id).json()["distillation_id"]
+        self.age(did, 300)  # 5 hours: still within the default
+        self.assertEqual(self.sweep().json(), {"failed": 0, "refund_errors": 0})
+        self.assertEqual((self.row(did).state, self.order_status(order_id)), ("GENERATING", "HELD"))
+        self.age(did, 361)
+        self.assertEqual(self.sweep().json(), {"failed": 1, "refund_errors": 0})
+        self.assertEqual((self.row(did).state, self.order_status(order_id)), ("FAILED", "REFUNDED"))
+        self.assertIn("too long", self.row(did).reason)
+        self.assertEqual([amount for _, amount in self.razorpay.refunds], [quote["total_paise"]])
+        self.assertEqual(self.sweep().json(), {"failed": 0, "refund_errors": 0})  # running it again does nothing and refunds nothing more
+        self.assertEqual(len(self.razorpay.refunds), 1)
+
+    def test_only_generating_ones_are_touched_and_the_window_can_be_chosen(self):
+        _, review, _ = self.in_review()  # waiting for the customer, not for the Coordinator
+        order_id, _ = self.paid_order(variant=" other")
+        slow = self.start(order_id).json()["distillation_id"]
+        self.age(slow, 120)
+        self.assertEqual(self.sweep({"older_than_minutes": 60}).json(), {"failed": 1, "refund_errors": 0})
+        self.assertEqual((self.row(review).state, self.row(slow).state), ("REVIEW", "FAILED"))
+
+    def test_a_regeneration_restarts_the_clock(self):
+        _, did, _ = self.in_review()
+        self.client("asha@example.com").post(self.url(did, "/regenerate"))
+        self.assertEqual(self.sweep().json(), {"failed": 0, "refund_errors": 0})  # just restarted, however old the first generation was
+
+    def test_a_refund_that_failed_is_retried_by_the_next_sweep(self):
+        order_id, _ = self.paid_order()
+        did = self.start(order_id).json()["distillation_id"]
+        self.age(did, 400)
+        self.razorpay.refund_fails = True
+        first = self.sweep()
+        self.assertEqual((first.status_code, first.json()), (200, {"failed": 1, "refund_errors": 1}))  # the timer is told, and carries on
+        self.assertEqual((self.row(did).state, self.order_status(order_id)), ("FAILED", "HELD"))
+        self.razorpay.refund_fails = False
+        self.assertEqual(self.sweep().json(), {"failed": 0, "refund_errors": 0})
+        self.assertEqual((self.order_status(order_id), len(self.razorpay.refunds)), ("REFUNDED", 1))
+
+    def test_one_refund_that_fails_does_not_stop_the_others(self):
+        ids = []
+        for variant in (" a", " b"):
+            order_id, _ = self.paid_order(variant=variant)
+            did = self.start(order_id).json()["distillation_id"]
+            self.age(did, 400)
+            ids.append((order_id, did))
+        self.razorpay.refund_fails = True
+        self.assertEqual(self.sweep().json(), {"failed": 2, "refund_errors": 2})
+        self.razorpay.refund_fails = False
+        self.assertEqual(self.sweep().json(), {"failed": 0, "refund_errors": 0})
+        self.assertEqual([self.order_status(o) for o, _ in ids], ["REFUNDED", "REFUNDED"])
+
+    def test_the_sweep_is_closed_without_the_token_and_refuses_absurd_windows(self):
+        self.assertEqual(self.sweep(headers={}).status_code, 404)
+        self.assertEqual(self.sweep({"older_than_minutes": 1}).status_code, 422)
+        self.assertEqual(self.sweep({"older_than_minutes": 10**7}).status_code, 422)
+        self.assertEqual(self.sweep({"surprise": 1}).status_code, 422)
+
+
 class Review(Base):
     def test_only_rows_in_the_sample_can_be_marked_wrong_and_only_while_in_review(self):
         _, did, _ = self.in_review()

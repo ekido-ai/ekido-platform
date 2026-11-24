@@ -22,6 +22,7 @@ def upgrade() -> None:
         sa.Column('dataset_id', sa.String(36), nullable=False),
         sa.Column('state', sa.String(16), nullable=False),
         sa.Column('generation_job_id', sa.String(36), nullable=True),
+        sa.Column('generating_since', sa.DateTime(timezone=True), nullable=True),
         sa.Column('generated', sa.LargeBinary, nullable=True),
         sa.Column('generated_rows', sa.Integer, nullable=False, server_default='0'),
         sa.Column('generated_sha256', sa.String(64), nullable=True),
