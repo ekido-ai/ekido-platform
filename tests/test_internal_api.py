@@ -21,10 +21,14 @@ H = {"X-Internal-Token": TOKEN}
 
 class FakeRefunds:
     def __init__(self):
-        self.refunds = []
+        self.refunds, self.payments = [], {}
+
+    def fetch_payment(self, payment_id):
+        return dict(self.payments[payment_id])
 
     def refund_payment(self, payment_id, amount_paise, *, receipt):
         self.refunds.append((payment_id, amount_paise, receipt))
+        self.payments[payment_id]["amount_refunded"] = amount_paise
         return {"id": "rfnd_1", "amount": amount_paise}
 
 
@@ -52,6 +56,8 @@ class Base(unittest.TestCase):
                                gateway_payment_id=f"pay_{rows}_{status}", status=status, quote=q, job_id=job_id)
             s.add(row)
             s.commit()
+            if getattr(self, "gateway", None) is not None and row.gateway_payment_id:
+                self.gateway.payments[row.gateway_payment_id] = {"id": row.gateway_payment_id, "order_id": row.gateway_order_id, "amount": row.amount_paise, "currency": "INR", "amount_refunded": 0}
             return row.id, q
 
 
