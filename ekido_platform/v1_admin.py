@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import JSON, DateTime, String, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Mapped, Session, mapped_column
@@ -28,6 +29,11 @@ from .models import Base, utcnow
 
 # (status, parsed JSON body); raises OSError when the Coordinator can't be reached.
 CoordinatorCall = Callable[[str, str], tuple[int, Any]]
+
+
+class AssistantSwitch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool
 
 
 class AdminAction(Base):
@@ -191,6 +197,41 @@ def build_admin_router(engine: Engine, principal: Callable, admin_emails: list[s
             raise AccountError("GATEWAY_UNAVAILABLE", "Razorpay didn't answer; nothing was refunded. Try again.", 503) from None
         log(session, who, "order.refund", order_id, "done", {"amount_paise": order.amount_paise, "status": order.status})
         return {"order_id": order.id, "status": order.status, "amount_paise": order.amount_paise}
+
+    @router.get("/assistant/teams")
+    def assistant_teams(who: tuple[str, str] = Depends(admin), session: Session = Depends(db)) -> list[dict[str, Any]]:
+        """Every team and whether the assistant is switched on for it (off by default)."""
+        from .v1_assistant import AssistantTeam
+
+        enabled = dict(session.execute(select(AssistantTeam.org_id, AssistantTeam.enabled)).all())
+        return [{"org_id": o.id, "team": o.name, "enabled": bool(enabled.get(o.id, False))}
+                for o in session.scalars(select(Org).order_by(Org.created_at.desc()).limit(500))]
+
+    @router.put("/assistant/teams/{org_id}")
+    def assistant_switch(org_id: str, body: AssistantSwitch, who: tuple[str, str] = Depends(admin),
+                         session: Session = Depends(db)) -> dict[str, Any]:
+        """Switch the assistant on or off for one team. Every change is written to the audit log."""
+        from .v1_assistant import AssistantTeam
+
+        if session.get(Org, org_id) is None:
+            raise AccountError("NOT_FOUND", "No such team.", 404)
+        row = session.get(AssistantTeam, org_id)
+        before = bool(row.enabled) if row is not None else False
+        if row is None:
+            session.add(AssistantTeam(org_id=org_id, enabled=body.enabled, updated_at=utcnow()))
+        else:
+            row.enabled, row.updated_at = body.enabled, utcnow()
+        session.commit()
+        log(session, who, "assistant.switch", org_id, "done", {"from": before, "to": body.enabled})
+        return {"org_id": org_id, "enabled": body.enabled}
+
+    @router.get("/assistant/unsupported")
+    def assistant_unsupported(who: tuple[str, str] = Depends(admin), session: Session = Depends(db)) -> list[dict[str, Any]]:
+        """What people asked for that Ekido cannot train yet: the day and the kind of request and a count, never the text."""
+        from .v1_assistant import AssistantUnsupported
+
+        rows = session.scalars(select(AssistantUnsupported).order_by(AssistantUnsupported.day.desc(), AssistantUnsupported.kind).limit(200))
+        return [{"day": r.day.isoformat(), "kind": r.kind, "count": r.count} for r in rows]
 
     @router.get("/audit")
     def audit(who: tuple[str, str] = Depends(admin), session: Session = Depends(db)) -> list[dict[str, Any]]:

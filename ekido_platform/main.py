@@ -52,7 +52,6 @@ class Settings(BaseSettings):
     # Qwen3Guard's engine (loopback). Required: without it the assistant answers 503.
     assistant_guard_url: str = ""
     assistant_state_secret: str = ""
-    assistant_datasets_root: str = ""
     # Emails allowed into the owner's admin area (ticket C26). Empty keeps it closed to everyone.
     admin_emails: list[str] = []
     # Razorpay, test mode only (ticket C7). The key id is public; the secret and the webhook secret come from the environment
@@ -82,7 +81,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
     engine = engine or create_engine_for(settings.database_url)
     # SQLite (tests): create the tables. Postgres: the schema belongs to the migrations in apps/platform/alembic,
     # which the service unit runs before it starts.
-    from . import payments, plans, privacy, v1_admin, v1_datasets, v1_invoices  # noqa: F401  (register their tables before create_all)
+    from . import payments, plans, privacy, v1_admin, v1_assistant, v1_datasets, v1_invoices  # noqa: F401  (register their tables before create_all)
 
     if engine.dialect.name == "sqlite":
         Base.metadata.create_all(engine)
@@ -113,8 +112,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
 
     from .v1_assistant import build_assistant_router
     app.include_router(build_assistant_router(engine, principal, settings.assistant_engine_url,
-        settings.assistant_state_secret, settings.assistant_datasets_root, guard_url=settings.assistant_guard_url,
-        transport=assistant_transport))
+        settings.assistant_state_secret, guard_url=settings.assistant_guard_url, transport=assistant_transport))
 
     from .payments import RazorpayHttpGateway, RazorpayRail
     from .v1_payments import build_payments_router

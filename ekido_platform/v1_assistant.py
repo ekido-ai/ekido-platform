@@ -1,4 +1,13 @@
-"""Authenticated, non-executing assistant previews with fail-closed policy screening."""
+"""The assistant: the front door to the recipes (decisions A1, A3, G1, G2 and U4, 24 Nov).
+
+A person describes the job in their own words. The assistant screens it twice (Qwen3Guard, then our own policy check),
+picks one of the recipes, and hands over to the normal upload, quote and pay flow. It never builds a job spec or starts
+anything: the quote path builds the only spec, from trusted inputs.
+
+What the models write is never shown or executed. They only classify, and every reply is fixed text here. Message text
+is never stored: a conversation is a short-lived signed token, and a request Ekido can't do yet is counted by kind only.
+It's off until switched on per team in the admin area, while it is evaluated.
+"""
 from __future__ import annotations
 
 import base64
@@ -9,38 +18,83 @@ import json
 import re
 import threading
 import time
-from pathlib import Path
-from typing import Callable, Literal
+from collections import deque
+from datetime import date, datetime
+from typing import Callable
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, select
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Mapped, Session, mapped_column
+
+from ekido_core.recipes import RECIPES
 
 from . import accounts
 from .accounts import AccountError, Principal
-from .assistant import AssistantError, build_preview, guard_decision, policy_decision, task_decision
+from .assistant import AssistantError, guard_decision, policy_decision, task_decision
+from .assistant_cards import CARDS_VERSION
 from .assistant_model import AssistantModel, GuardModel, POLICY_SCHEMA, POLICY_SYSTEM, TASK_SCHEMA, TASK_SYSTEM
+from .models import Base, utcnow
+from .v1_datasets import Dataset
+
+UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+RATE_LIMIT, RATE_WINDOW = 20, 600  # messages per person per 10 minutes
+
+
+class AssistantTeam(Base):
+    """Whether a team may use the assistant. Off by default; switched in the admin area (audited)."""
+
+    __tablename__ = 'assistant_teams'
+    org_id: Mapped[str] = mapped_column(String(32), ForeignKey('orgs.id'), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AssistantUnsupported(Base):
+    """Requests Ekido can't train yet, counted by day and kind only. No text, no person, no team."""
+
+    __tablename__ = 'assistant_unsupported'
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), primary_key=True)
+    count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Message(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     message: str = Field(min_length=1, max_length=4000)
     conversation_id: str | None = Field(default=None, max_length=2048)
-    dataset_id: str | None = Field(default=None, max_length=103)
-    base_model: Literal['qwen2.5-0.5b-instruct', 'qwen2.5-1.5b-instruct'] = 'qwen2.5-0.5b-instruct'
+    # A signed-in person names the team they're working in; an API key already belongs to one.
+    org_id: str | None = Field(default=None, max_length=32)
+    dataset_id: str | None = Field(default=None, max_length=36)
 
 
+TASKS = {'en': 'ticket sorting, invoice fields, product descriptions, customer-question answers, or review sentiment',
+         'hi': 'टिकट छाँटना, इनवॉइस पढ़ना, उत्पाद विवरण, ग्राहकों के सवालों के जवाब, या समीक्षा भावना',
+         'hinglish': 'ticket sorting, invoice fields, product descriptions, customer questions ke jawab, ya review sentiment'}
 REPLIES = {
-    'en': {'clarify': 'Which task do you need: ticket sorting, invoice fields, product descriptions, clinic FAQs, or review sentiment?',
-           'dataset': 'Select an authorized dataset for {recipe} and provide its dataset ID.',
-           'preview': 'Review this suggested job before continuing.'},
-    'hi': {'clarify': 'आपको कौन सा काम चाहिए: टिकट छाँटना, इनवॉइस पढ़ना, उत्पाद विवरण, क्लिनिक FAQ या समीक्षा भावना?',
-           'dataset': '{recipe} के लिए अपना अधिकृत डेटासेट चुनें और उसकी डेटासेट ID दें।',
-           'preview': 'आगे बढ़ने से पहले इस सुझाए गए काम को जाँचें।'},
-    'hinglish': {'clarify': 'Aapko kaunsa kaam chahiye: ticket sorting, invoice fields, product descriptions, clinic FAQ ya review sentiment?',
-                 'dataset': '{recipe} ke liye apna authorized dataset select karke uski dataset ID dein.',
-                 'preview': 'Aage badhne se pehle is suggested job ko check karein.'},
+    'en': {'clarify': 'Which of these fits best: {tasks}?',
+           'upload': 'This fits "{title}". Next, upload your examples as a CSV with the columns {columns}.',
+           'quote': 'This fits "{title}", and your dataset matches. Next, get a quote.',
+           'unsupported': "Ekido can't train a model for that yet. Today it can do {tasks}.",
+           'closest': ' The closest is "{title}".',
+           'refuse': 'I can\'t help create a model for that request.',
+           'review': 'This request needs a policy review before it can go ahead.'},
+    'hi': {'clarify': 'इनमें से कौन सा काम सबसे सही है: {tasks}?',
+           'upload': 'यह "{title}" के लिए सही है। अब अपने उदाहरण CSV में अपलोड करें, कॉलम: {columns}।',
+           'quote': 'यह "{title}" के लिए सही है, और आपका डेटासेट मेल खाता है। अब कोटेशन लें।',
+           'unsupported': 'Ekido अभी इसके लिए मॉडल नहीं बना सकता। आज यह कर सकता है: {tasks}।',
+           'closest': ' सबसे नज़दीकी: "{title}"।',
+           'refuse': 'मैं इस अनुरोध के लिए मॉडल बनाने में मदद नहीं कर सकता।',
+           'review': 'आगे बढ़ने से पहले इस अनुरोध की नीति समीक्षा ज़रूरी है।'},
+    'hinglish': {'clarify': 'Inmein se kaunsa kaam sahi hai: {tasks}?',
+                 'upload': 'Ye "{title}" ke liye sahi hai. Ab apne examples CSV mein upload karein, columns: {columns}.',
+                 'quote': 'Ye "{title}" ke liye sahi hai, aur aapka dataset match karta hai. Ab quote lijiye.',
+                 'unsupported': 'Ekido abhi iske liye model nahi bana sakta. Aaj ye kar sakta hai: {tasks}.',
+                 'closest': ' Sabse kareeb: "{title}".',
+                 'refuse': 'Main is request ke liye model banane mein madad nahi kar sakta.',
+                 'review': 'Aage badhne se pehle is request ka policy review zaroori hai.'},
 }
 
 
@@ -67,46 +121,58 @@ def _decode(token: str, secret: str, subject: str) -> dict:
                 or state['subject'] != subject or type(state['expires']) is not int
                 or state['expires'] < int(time.time()) or state['expires'] > int(time.time()) + 1800
                 or state['language'] not in ('en', 'hi', 'hinglish')
-                or (state['recipe_id'] is not None and state['recipe_id'] not in accounts_recipes())):
+                or (state['recipe_id'] is not None and state['recipe_id'] not in RECIPES)):
             raise ValueError('state')
         return state
     except (ValueError, TypeError, KeyError, UnicodeDecodeError, binascii.Error):
         raise AccountError('INVALID_CONVERSATION', 'Start a new assistant conversation.', 400) from None
 
 
-def accounts_recipes():
-    from ekido_core.recipes import RECIPES
-    return RECIPES
+def count_unsupported(engine: Engine, kind: str) -> None:
+    """Add one to today's count for this kind. Two requests at once both count (the second retries as an update)."""
+    today = utcnow().date()
+    for _ in range(2):
+        with Session(engine) as session:
+            row = session.get(AssistantUnsupported, (today, kind))
+            if row is None:
+                session.add(AssistantUnsupported(day=today, kind=kind, count=1))
+            else:
+                row.count += 1
+            try:
+                session.commit()
+                return
+            except IntegrityError:
+                session.rollback()
 
 
-def _dataset(root: Path | None, dataset_id: str, engine: Engine, who: Principal) -> dict:
-    if root is None:
-        raise AccountError('ASSISTANT_UNAVAILABLE', 'Dataset storage is not configured.', 503)
-    if not re.fullmatch(r'ds_[A-Za-z0-9_-]{1,100}', dataset_id):
-        raise AccountError('NOT_FOUND', 'No such dataset.', 404)
-    try:
-        path = (root / f'{dataset_id}.json').resolve()
-        path.relative_to(root)
-        with path.open('rb') as handle:
-            raw = handle.read(16_385)
-        if len(raw) > 16_384:
-            raise ValueError('too large')
-        value = json.loads(raw)
-        if not isinstance(value, dict) or not isinstance(value.get('org_id'), str) or not value['org_id']:
-            raise ValueError('invalid owner')
-    except (ValueError, OSError, UnicodeError):
-        raise AccountError('NOT_FOUND', 'No such dataset.', 404) from None
-    with Session(engine) as session:
-        accounts.require_role(session, who, value['org_id'], *accounts.ROLES)
-        if who.via == 'api_key' and 'jobs' not in who.scopes:
-            raise AccountError('FORBIDDEN', 'The API key needs jobs scope.', 403)
-    return value
+class RateLimit:
+    """At most `limit` messages per person per `window` seconds, in this process (Valkey later, decision 5)."""
+
+    def __init__(self, limit: int = RATE_LIMIT, window: int = RATE_WINDOW, max_people: int = 10_000):
+        self.limit, self.window, self.max_people = limit, window, max_people
+        self.seen: dict[str, deque] = {}
+        self.lock = threading.Lock()
+
+    def allow(self, subject: str, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            if subject not in self.seen and len(self.seen) >= self.max_people:
+                for key in [k for k, q in self.seen.items() if not q or now - q[-1] > self.window]:
+                    del self.seen[key]
+                if len(self.seen) >= self.max_people:
+                    return False
+            times = self.seen.setdefault(subject, deque())
+            while times and now - times[0] > self.window:
+                times.popleft()
+            if len(times) >= self.limit:
+                return False
+            times.append(now)
+            return True
 
 
-def build_assistant_router(engine: Engine, principal: Callable, engine_url: str, state_secret: str,
-                           datasets_root: str, *, guard_url: str = '', transport=None) -> APIRouter:
+def build_assistant_router(engine: Engine, principal: Callable, engine_url: str, state_secret: str, *,
+                           guard_url: str = '', transport=None, limiter: RateLimit | None = None) -> APIRouter:
     router = APIRouter(prefix='/v1')
-    root = Path(datasets_root).resolve() if datasets_root else None
     try:
         model = AssistantModel(engine_url, transport=transport) if engine_url else None
     except AssistantError:
@@ -116,50 +182,79 @@ def build_assistant_router(engine: Engine, principal: Callable, engine_url: str,
     except AssistantError:
         guard = None
     permits = threading.BoundedSemaphore(2)
+    limiter = limiter or RateLimit()
+
+    def team_of(who: Principal, org_id: str | None) -> str:
+        if who.via == 'api_key':
+            if 'jobs' not in who.scopes:
+                raise AccountError('FORBIDDEN', 'The API key needs jobs scope.', 403)
+            return who.org_id
+        if not org_id:
+            raise AccountError('ORG_REQUIRED', 'Say which team this is for (org_id).', 400)
+        with Session(engine) as session:
+            accounts.require_role(session, who, org_id, *accounts.ROLES)
+        return org_id
 
     @router.post('/assistant/messages')
     def message(body: Message, who: Principal = Depends(principal)) -> dict:
-        # The guard is required: without it the assistant doesn't answer (fail closed, decision G1).
         if model is None or guard is None or len(state_secret) < 32:
+            # The guard is required too: without it the assistant doesn't answer (fail closed, decision G1).
             raise AccountError('ASSISTANT_UNAVAILABLE', 'Assistant is not configured.', 503)
-        if who.via == 'api_key' and 'jobs' not in who.scopes:
-            raise AccountError('FORBIDDEN', 'The API key needs jobs scope.', 403)
+        org_id = team_of(who, body.org_id)
+        with Session(engine) as session:
+            switch = session.get(AssistantTeam, org_id)
+            if switch is None or not switch.enabled:
+                raise AccountError('ASSISTANT_NOT_ENABLED', 'The assistant is not switched on for this team yet.', 403)
+            dataset = None
+            if body.dataset_id is not None:
+                found = session.get(Dataset, body.dataset_id) if UUID.fullmatch(body.dataset_id) else None
+                if found is None or found.org_id != org_id:
+                    raise AccountError('NOT_FOUND', 'No such dataset.', 404)
+                dataset = {'id': found.id, 'recipe_id': found.recipe_id}
         subject = _subject(who)
+        if not limiter.allow(subject):
+            raise AccountError('RATE_LIMITED', 'Too many assistant messages. Try again in a few minutes.', 429)
         state = _decode(body.conversation_id, state_secret, subject) if body.conversation_id else {
             'subject': subject, 'expires': int(time.time()) + 1800, 'recipe_id': None, 'language': 'en'}
-        dataset = _dataset(root, body.dataset_id, engine, who) if body.dataset_id else None
         if not permits.acquire(blocking=False):
             raise AccountError('ASSISTANT_BUSY', 'Assistant is busy. Try again.', 503)
         try:
-            # 1. Qwen3Guard, a separate model trained for safety (decision G1). 2. Our own policy check. Both must allow.
+            # 1. Qwen3Guard, a separate model trained for safety (G1). 2. Our own policy check. Both must allow.
             screened, _ = guard_decision(guard.classify(body.message))
             decision = screened if screened != 'allow' else policy_decision(model.decide(POLICY_SYSTEM, body.message, POLICY_SCHEMA))
             if decision != 'allow':
                 return {'conversation_id': _encode(state, state_secret), 'refused': decision,
-                        'reply': 'This request cannot proceed without policy review.' if decision == 'review'
-                                 else 'I cannot help create a model for that request.'}
+                        'reply': REPLIES[state['language']][decision], 'cards_version': CARDS_VERSION}
             context = f"Previously selected recipe: {state['recipe_id'] or 'none'}.\nCurrent message:\n{body.message}"
             task = task_decision(model.decide(TASK_SYSTEM, context, TASK_SCHEMA))
         except AssistantError:
             raise AccountError('ASSISTANT_UNAVAILABLE', 'Assistant could not safely process this request.', 503) from None
         finally:
             permits.release()
+        language = state['language'] = task['language']
+        replies = REPLIES[language]
+        answer = {'language': language, 'cards_version': CARDS_VERSION}
+        if task['action'] == 'unsupported':
+            count_unsupported(engine, task['kind'])
+            reply = replies['unsupported'].format(tasks=TASKS[language])
+            if task['recipe_id']:
+                reply += replies['closest'].format(title=RECIPES[task['recipe_id']].title)
+                answer['closest_recipe_id'] = task['recipe_id']
+            return {**answer, 'conversation_id': _encode(state, state_secret), 'unsupported': True, 'reply': reply}
         if task['action'] == 'propose':
             state['recipe_id'] = task['recipe_id']
-        state['language'] = task['language']
         conversation_id = _encode(state, state_secret)
         if task['action'] == 'clarify' or state['recipe_id'] is None:
-            return {'conversation_id': conversation_id,
-                    'reply': REPLIES[state['language']]['clarify']}
-        if dataset is None:
-            return {'conversation_id': conversation_id,
-                    'reply': REPLIES[state['language']]['dataset'].format(recipe=state['recipe_id'])}
-        try:
-            proposal, spec = build_preview(state['recipe_id'], body.dataset_id, dataset, body.base_model)
-        except AssistantError:
-            raise AccountError('INVALID_DATASET', 'Dataset does not match this recipe or has invalid metadata.', 422) from None
-        return {'conversation_id': conversation_id, 'reply': REPLIES[state['language']]['preview'],
-                'proposal': proposal, 'job_spec': spec, 'language': state['language'],
-                'policy_status': 'model_screened_needs_review'}
+            return {**answer, 'conversation_id': conversation_id, 'reply': replies['clarify'].format(tasks=TASKS[language])}
+        recipe = RECIPES[state['recipe_id']]
+        proposal = {'recipe_id': recipe.recipe_id, 'next': 'upload'}
+        if recipe.labels:
+            proposal['labels'] = list(recipe.labels)
+        if dataset is not None and dataset['recipe_id'] == recipe.recipe_id:
+            proposal.update(dataset_id=dataset['id'], next='quote')
+        key = 'quote' if proposal['next'] == 'quote' else 'upload'
+        return {**answer, 'conversation_id': conversation_id, 'proposal': proposal,
+                'policy_status': 'model_screened_needs_review',
+                'reply': replies[key].format(title=recipe.title, columns=' and '.join(recipe.columns))}
 
     return router
