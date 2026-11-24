@@ -241,6 +241,22 @@ class GuardStep(AssistantRoute):
         self.assertEqual(TestClient(app).post(self.url, headers={'authorization': f'Bearer {key}'}, json={'message': 'hi'}).status_code, 503)
 
 
+class RouteRateLimit(AssistantRoute):
+    """The default is the product's limit: 20 messages per person per 10 minutes."""
+
+    def test_the_twenty_first_message_in_a_window_is_refused_with_429(self):
+        self.policy = 'refuse'  # the cheapest path: the guard and our policy check, never the task model
+        codes = [self.post('hello').status_code for _ in range(21)]
+        self.assertEqual(codes, [200] * 20 + [429])
+
+    def test_the_limit_is_a_validated_setting(self):
+        self.assertEqual((Settings(_env_file=None).assistant_rate_limit, Settings(_env_file=None).assistant_rate_window), (20, 600))
+        self.assertEqual(Settings(_env_file=None, assistant_rate_limit=500).assistant_rate_limit, 500)
+        for bad in (0, -1, 100_001):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                Settings(_env_file=None, assistant_rate_limit=bad)
+
+
 class GuardDecision(unittest.TestCase):
     def test_labels_and_categories(self):
         self.assertEqual(guard_decision('Safety: Safe\nCategories: None'), ('allow', []))
