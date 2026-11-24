@@ -68,6 +68,18 @@ class SavingsEndpoint(unittest.TestCase):
         self.write('model.json', {'job_id': 'other'})
         self.assertEqual(self.client.get(self.url, headers=auth).status_code, 503)
 
+    def test_incomparable_quality_suppresses_savings_but_keeps_costs(self):
+        self.write('model.json', {'job_id': 'job1', 'model_id': 'model1', 'eval_set_hash': 'a' * 64,
+                                 'examples': 5, 'metric': 'accuracy', 'score': .5})
+        response = self.client.get(self.url, headers={'authorization': f'Bearer {self.key}'})
+        self.assertEqual(response.status_code, 200, response.text)
+        report = response.json()
+        self.assertFalse(report['quality']['comparable'])
+        self.assertIsNone(report['first_month_difference_paise'])
+        self.assertIsNone(report['later_month_difference_paise'])
+        self.assertEqual(report['ekido']['training_paise'], 20)
+        self.assertEqual(len(report['sources']), 4)
+
     def test_signed_in_owner_and_unconfigured_store(self):
         self.assertEqual(self.client.get(self.url, cookies={'ekido_session': self.token}).status_code, 200)
         app = create_app(Settings(database_url='sqlite://', _env_file=None))

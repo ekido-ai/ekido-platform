@@ -151,6 +151,7 @@ def build_savings_report(*, evidence_root: Path, model_id: str, expected_request
         api_paise = int(api_monthly.to_integral_value(rounding=ROUND_CEILING))
         hosting_paise = int(hosting.to_integral_value(rounding=ROUND_CEILING))
     sources = {api_path: api_hash, model_path: model_hash, quote_path: quote_hash, price_path: price_hash}
+    comparable = model_score >= api_score - QUALITY_MARGIN
     return {
         'model_id': model_id,
         'assumed_requests_per_month': expected_requests,
@@ -162,9 +163,11 @@ def build_savings_report(*, evidence_root: Path, model_id: str, expected_request
                     'metric': model['metric'], 'eval_set_hash': test_hash, 'examples': examples,
                     'difference': float(model_score - api_score), 'margin': float(QUALITY_MARGIN),
                     # Savings only mean something for a model that does the job about as well.
-                    'comparable': model_score >= api_score - QUALITY_MARGIN},
-        'first_month_difference_paise': api_paise - training - hosting_paise,
-        'later_month_difference_paise': api_paise - hosting_paise,
+                    'comparable': comparable},
+        # Do not present a savings difference when the measured model is too
+        # far below the API on the same task. Keep both underlying costs visible.
+        'first_month_difference_paise': api_paise - training - hosting_paise if comparable else None,
+        'later_month_difference_paise': api_paise - hosting_paise if comparable else None,
         'sources': list(sources), 'source_sha256': sources,
         'evidence': {'api_run': api_path, 'model_run': model_path, 'quote': quote_path, 'api_price': price_path},
         'request_volume_source': 'customer assumption', 'self_hosted': self_hosted,
