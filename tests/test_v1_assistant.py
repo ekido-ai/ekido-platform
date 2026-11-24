@@ -33,6 +33,12 @@ class AssistantRoute(unittest.TestCase):
             with self.subTest(category=category):
                 self.assertIn(category, POLICY_SYSTEM)
 
+    def test_the_policy_prompt_allows_ordinary_requests_by_default_and_gives_examples(self):
+        # Measured on staging with Qwen2.5-1.5B: the earlier wording ("if ambiguous choose review") sent 10 of 10 harmless requests to review.
+        for text in ('Choose allow for any ordinary business request', 'Decision: allow.', 'Decision: refuse.'):
+            self.assertIn(text, POLICY_SYSTEM)
+        self.assertNotIn('never guess allow', POLICY_SYSTEM)
+
     def setUp(self):
         self.policy = 'allow'
         self.task = {'action': 'propose', 'recipe_id': 'ticket-sorter-hinglish', 'language': 'hinglish', 'kind': None}
