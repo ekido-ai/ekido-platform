@@ -177,7 +177,8 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
         session.execute(delete(plans.PlanUsage).where(plans.PlanUsage.org_id == org_id))
         session.execute(delete(plans.TeamPlan).where(plans.TeamPlan.org_id == org_id))
 
-    app.include_router(build_privacy_router(engine, principal, exporters={"payments": export_payments, "plans": export_plans}, org_erasers=[erase_plans]))
+    app.include_router(build_privacy_router(engine, principal, exporters={"payments": export_payments, "plans": export_plans}, org_erasers=[erase_plans],
+                                            job_checks=[privacy.refuse_while_jobs_run(lambda: app.state.coordinator_get)]))
     @app.exception_handler(AccountError)
     async def account_refused(_: Request, exc: AccountError):
         return error(exc)

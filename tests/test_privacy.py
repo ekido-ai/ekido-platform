@@ -31,6 +31,23 @@ class FakeSubscriptions:
         return {}
 
 
+class FakeCoordinator:
+    """Answers `GET /jobs/<id>` like the Coordinator: 200 with a state for a known job, 404 for an unknown one."""
+
+    def __init__(self):
+        self.states, self.calls = {}, []
+        self.down, self.status, self.body = False, None, None
+
+    def __call__(self, method, path):
+        self.calls.append((method, path))
+        if self.down:
+            raise OSError("the coordinator is down")
+        if self.status is not None:
+            return self.status, self.body
+        job_id = path.rsplit("/", 1)[1]
+        return (200, {"state": self.states[job_id]}) if job_id in self.states else (404, None)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         settings = Settings(database_url="sqlite://", _env_file=None, email_sender="log", site_url=SITE, cors_origins=[SITE], session_cookie_secure=False,
@@ -38,6 +55,8 @@ class Base(unittest.TestCase):
         self.app = create_app(settings)
         self.gateway = FakeSubscriptions()
         self.app.state.plans.gateway = self.gateway
+        self.coordinator = FakeCoordinator()
+        self.app.state.coordinator_get = self.coordinator  # the real one would call a server that is not there
         self.engine = self.app.state.engine
         self.clients = {}
 
@@ -269,6 +288,78 @@ class DeleteTests(Base):
         self.assertEqual((self.count(UserEmail), self.count(Org), self.count(ApiKey), self.count(JobOwner), self.count(Consent), self.count(privacy.DeletionRequest),
                           self.count(privacy.ErasureTask)), (1, 1, 1, 2, 1, 0, 0))
         self.assertEqual(self.client().get("/v1/me").status_code, 200)
+
+    def nothing_was_deleted(self):
+        self.assertEqual((self.count(UserEmail), self.count(Org), self.count(ApiKey), self.count(JobOwner), self.count(Consent), self.count(privacy.DeletionRequest),
+                          self.count(privacy.ErasureTask)), (1, 1, 1, 2, 1, 0, 0))
+        self.assertEqual(self.client().get("/v1/me").status_code, 200)  # still signed in
+
+    def test_a_team_with_a_job_still_running_cannot_be_erased_and_nothing_is_deleted(self):
+        for state in ("OPEN", "ASSIGNED", "RUNNING", "RECOVERING", "VALIDATING", "COMPLETED", "DISPUTED", ""):
+            with self.subTest(state):
+                self.setUp()
+                self.setup_asha()
+                self.coordinator.states.update({"job-1": "SETTLED", "job-2": state})
+                response = self.client().delete("/v1/me")
+                self.assertEqual((response.status_code, response.json()["error"]), (409, "JOB_RUNNING"))
+                self.assertIn("1 job still running", response.json()["detail"])
+                self.nothing_was_deleted()
+
+    def test_every_job_that_has_ended_and_every_job_the_coordinator_does_not_know_lets_the_deletion_go_ahead(self):
+        for first, second in (("SETTLED", "FAILED"), ("CANCELLED", "REFUNDED"), ("SETTLED", None)):
+            with self.subTest((first, second)):
+                self.setUp()
+                self.setup_asha()
+                self.coordinator.states["job-1"] = first
+                if second:
+                    self.coordinator.states["job-2"] = second  # job-2 unknown to the Coordinator otherwise: a 404
+                self.assertEqual(self.client().delete("/v1/me").status_code, 202)
+
+    def test_the_message_counts_the_running_jobs_and_a_retry_works_once_they_have_ended(self):
+        self.setup_asha()
+        self.coordinator.states.update({"job-1": "RUNNING", "job-2": "VALIDATING"})
+        response = self.client().delete("/v1/me")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("2 jobs still running", response.json()["detail"])
+        self.nothing_was_deleted()
+        self.coordinator.states.update({"job-1": "SETTLED", "job-2": "CANCELLED"})
+        self.assertEqual(self.client().delete("/v1/me").status_code, 202)
+
+    def test_if_the_coordinator_cannot_be_asked_the_deletion_waits_and_nothing_is_deleted(self):
+        for label, arrange in (("unreachable", lambda: setattr(self.coordinator, "down", True)),
+                               ("a server error", lambda: (setattr(self.coordinator, "status", 500), setattr(self.coordinator, "body", {"detail": "x"}))),
+                               ("not an object", lambda: (setattr(self.coordinator, "status", 200), setattr(self.coordinator, "body", ["state"])))):
+            with self.subTest(label):
+                self.setUp()
+                self.setup_asha()
+                arrange()
+                response = self.client().delete("/v1/me")
+                self.assertEqual((response.status_code, response.json()["error"]), (503, "JOB_CHECK_UNAVAILABLE"))
+                self.nothing_was_deleted()
+
+    def test_a_person_with_no_jobs_to_protect_is_never_held_up_by_the_coordinator(self):
+        self.make_org("asha@example.com")  # an empty team, no jobs
+        self.coordinator.down = True
+        self.assertEqual(self.client().delete("/v1/me").status_code, 202)
+        self.assertEqual(self.coordinator.calls, [])
+
+    def test_leaving_a_shared_team_is_not_held_up_by_that_teams_running_job(self):
+        org = self.make_org("asha@example.com")
+        self.client().post(f"/v1/orgs/{org}/members", json={"email": "ravi@example.com", "role": "owner"})
+        with Session(self.engine) as s:
+            s.add(JobOwner(job_id="job-1", org_id=org))
+            s.commit()
+        self.coordinator.states["job-1"] = "RUNNING"
+        self.assertEqual(self.client().delete("/v1/me").status_code, 202)  # the team stays, so its job is safe
+        self.assertEqual(self.coordinator.calls, [])
+
+    def test_the_job_id_is_quoted_when_the_coordinator_is_asked(self):
+        org = self.make_org("asha@example.com")
+        with Session(self.engine) as s:
+            s.add(JobOwner(job_id="a/b c", org_id=org))
+            s.commit()
+        self.client().delete("/v1/me")
+        self.assertEqual(self.coordinator.calls, [("GET", "/jobs/a%2Fb%20c")])
 
     def test_asking_twice_does_not_erase_twice(self):
         self.setup_asha()
