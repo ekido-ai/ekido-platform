@@ -36,7 +36,7 @@ still supplied by the trusted artifact producer. Run scores are
 normalised to the interval from zero to one. The calculation refuses mismatched job,
 test-set hash, example count, metric or quote model. Input and output token usage
 comes from the measured API run. Positive paise amounts are rounded up to whole paise.
-`quality.comparable` is true only when Ekido's score is at least the API's score minus 0.02 (the default non-inferiority margin); show savings to a customer only when it is true, because savings from a worse model are not savings. The first-month difference includes the one-time training cost; the later-month
+`quality.comparable` is true only when Ekido's score is at least the API's score minus 0.02 (the default non-inferiority margin). When it is false, `first_month_difference_paise` and `later_month_difference_paise` are JSON `null`, while the individual API and Ekido costs remain available. Clients must handle these nullable values; savings from a worse model are not comparable. The first-month difference includes the one-time training cost; the later-month
 difference does not. A negative difference represents a higher Ekido cost. Self-hosting
 sets Ekido hosting to zero; it does not measure the customer's own infrastructure cost.
 

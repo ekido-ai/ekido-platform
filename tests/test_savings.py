@@ -52,11 +52,22 @@ class SavingsReport(unittest.TestCase):
         self.files['model.json']['score'] = 0.80  # 0.01 below the API: within the margin
         self.write_files()
         self.assertTrue(self.report()['quality']['comparable'])
+        self.files['model.json']['score'] = '0.79'  # exactly at the margin
+        self.write_files()
+        self.assertEqual(self.report()['first_month_difference_paise'], 136500)
+        self.files['model.json']['score'] = '0.7899'
+        self.write_files()
+        self.assertIsNone(self.report()['first_month_difference_paise'])
         self.files['model.json']['score'] = 0.60
         self.write_files()
-        quality = self.report()['quality']
+        report = self.report()
+        quality = report['quality']
         self.assertFalse(quality['comparable'])
         self.assertAlmostEqual(quality['difference'], -0.21)
+        self.assertIsNone(report['first_month_difference_paise'])
+        self.assertIsNone(report['later_month_difference_paise'])
+        self.assertEqual(report['api_baseline']['monthly_paise'], 140000)
+        self.assertEqual(report['ekido']['training_paise'], 3000)
 
     def test_different_or_missing_task_evidence_is_refused(self):
         for name, field, value in [('api.json', 'eval_set_hash', 'b' * 64),
