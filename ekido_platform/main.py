@@ -12,6 +12,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -52,6 +53,10 @@ class Settings(BaseSettings):
     # Qwen3Guard's engine (loopback). Required: without it the assistant answers 503.
     assistant_guard_url: str = ""
     assistant_state_secret: str = ""
+    # Messages one person may send the assistant per window (seconds). The defaults are the product's limit; staging raises them only to
+    # run the evaluation sets, which send more than 20 messages in ten minutes.
+    assistant_rate_limit: int = Field(default=20, ge=1, le=100_000)
+    assistant_rate_window: int = Field(default=600, ge=1, le=86_400)
     # Emails allowed into the owner's admin area (ticket C26). Empty keeps it closed to everyone.
     admin_emails: list[str] = []
     # Razorpay, test mode only (ticket C7). The key id is public; the secret and the webhook secret come from the environment
@@ -110,9 +115,10 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
                                                    v1_admin.coordinator_client(settings.coordinator_url, settings.coordinator_token),
                                                    payment_rail=lambda: getattr(app.state, "payment_rail", None)))
 
-    from .v1_assistant import build_assistant_router
+    from .v1_assistant import RateLimit, build_assistant_router
     app.include_router(build_assistant_router(engine, principal, settings.assistant_engine_url,
-        settings.assistant_state_secret, guard_url=settings.assistant_guard_url, transport=assistant_transport))
+        settings.assistant_state_secret, guard_url=settings.assistant_guard_url, transport=assistant_transport,
+        limiter=RateLimit(settings.assistant_rate_limit, settings.assistant_rate_window)))
 
     from .payments import RazorpayHttpGateway, RazorpayRail
     from .v1_payments import build_payments_router
