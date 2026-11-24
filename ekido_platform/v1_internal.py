@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from . import privacy
 from .payments import PaymentError, PaymentOrder, RazorpayRail
+from . import v1_distill
 
 
 class LinkJob(BaseModel):
@@ -99,6 +100,18 @@ def build_internal_router(engine: Engine, internal_token: str, rail: RazorpayRai
         order.job_id = body.job_id
         session.commit()
         return {"order_id": order.id, "job_id": order.job_id}
+
+    @router.post("/distillations/{distillation_id}/generated", dependencies=[Depends(guard)])
+    def distillation_generated(distillation_id: str, body: v1_distill.Generated, session: Session = Depends(db)) -> dict[str, Any]:
+        """The Coordinator's report that example generation finished, with the rows and the verifier's verdict. Idempotent."""
+        row = v1_distill.accept_rows(session, distillation_id, body, rail)
+        return {"distillation_id": row.id, "state": row.state}
+
+    @router.post("/distillations/{distillation_id}/failed", dependencies=[Depends(guard)])
+    def distillation_failed(distillation_id: str, body: v1_distill.GenerationFailed, session: Session = Depends(db)) -> dict[str, Any]:
+        """The generation job failed (no device, timed out): the customer is refunded in full. Idempotent."""
+        row = v1_distill.fail_generation(session, distillation_id, body.reason, rail)
+        return {"distillation_id": row.id, "state": row.state}
 
     @router.get("/payments/jobs/{job_id}", dependencies=[Depends(guard)])
     def job_order(job_id: str, session: Session = Depends(db)) -> dict[str, Any]:
