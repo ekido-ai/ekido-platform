@@ -373,7 +373,7 @@ class RazorpayRail:
         window = (datetime.fromtimestamp(from_ts, timezone.utc), datetime.fromtimestamp(to_ts, timezone.utc))
         for order in session.scalars(select(PaymentOrder).where(PaymentOrder.status.in_((HELD, SETTLED, REFUNDED)))):
             created = order.created_at if order.created_at.tzinfo else order.created_at.replace(tzinfo=timezone.utc)
-            if window[0] <= created <= window[1] and order.id not in seen_orders:
+            if window[0] <= created <= window[1] and order.id not in seen_orders and not self._confirmed_at_gateway(order):
                 report.missing_at_gateway.append(order.id)
             if not self._balanced(session, order):
                 report.ledger_unbalanced.append(order.id)
@@ -393,6 +393,20 @@ class RazorpayRail:
     def _earnings(self, session: Session, order: PaymentOrder) -> dict[str, int]:
         rows = session.scalars(select(LedgerEntry).where(LedgerEntry.order_id == order.id, LedgerEntry.kind == "PROVIDER_EARNING"))
         return {row.account: row.amount_paise for row in rows}
+
+    def _confirmed_at_gateway(self, order: PaymentOrder) -> bool:
+        """Razorpay's payment *list* can lag a few seconds behind a payment that exists, so before calling an order missing, ask for its payment
+        directly. True only if that payment is this order's, for the same amount, and its refund state agrees with ours; anything else (no
+        payment recorded, not found, unreachable, a difference) stays reported."""
+        if not order.gateway_payment_id:
+            return False
+        try:
+            payment = self.gateway.fetch_payment(order.gateway_payment_id)
+        except PaymentError:
+            return False
+        refunded = payment.get("status") == "refunded" or bool(payment.get("amount_refunded"))
+        return (payment.get("order_id") == order.gateway_order_id and payment.get("amount") == order.amount_paise
+                and payment.get("status") in ("captured", "refunded") and refunded == (order.status == REFUNDED))
 
     def _balanced(self, session: Session, order: PaymentOrder) -> bool:
         rows = list(session.scalars(select(LedgerEntry).where(LedgerEntry.order_id == order.id)))
