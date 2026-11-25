@@ -54,7 +54,9 @@ class AssistantModel:
         payload = {'model': 'Qwen/Qwen2.5-1.5B-Instruct', 'temperature': 0, 'max_tokens': 256,
                    'stream': False, 'messages': [{'role': 'system', 'content': system},
                                                   {'role': 'user', 'content': user_text}],
-                   'response_format': {'type': 'json_object', 'schema': schema}}
+                   'response_format': {'type': 'json_object', 'schema': schema},
+                   # Thinking models would spend the whole token budget reasoning and return no answer.
+                   'chat_template_kwargs': {'enable_thinking': False}}
         try:
             with httpx.Client(trust_env=False, follow_redirects=False, timeout=120, transport=self.transport) as client:
                 with client.stream('POST', self.origin + '/v1/chat/completions', json=payload) as response:

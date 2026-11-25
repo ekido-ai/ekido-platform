@@ -76,12 +76,16 @@ def task_decision(text: str) -> dict:
     recipe, kind = result['recipe_id'], result['kind']
     if recipe is not None and (not isinstance(recipe, str) or recipe not in RECIPES):
         raise AssistantError('unknown recipe')
+    if kind is not None and kind not in UNSUPPORTED_KINDS:
+        raise AssistantError('unknown request kind')
+    # Small models often fill a field their action does not use (measured 25 Nov 2026: "clarify" with a kind). The extra
+    # value was checked above and is dropped, so it can never select or count anything.
     if result['action'] == 'propose':
-        if recipe is None or kind is not None:
-            raise AssistantError('a proposal names one recipe and no kind')
-    elif result['action'] == 'clarify':
-        if recipe is not None or kind is not None:
-            raise AssistantError('a clarification selects nothing')
-    elif kind not in UNSUPPORTED_KINDS:  # unsupported: a known kind; recipe_id is the nearest recipe, or null
+        if recipe is None:
+            raise AssistantError('a proposal names one recipe')
+        return {**result, 'kind': None}
+    if result['action'] == 'clarify':
+        return {**result, 'recipe_id': None, 'kind': None}
+    if kind is None:  # unsupported: a known kind; recipe_id is the nearest recipe, or null
         raise AssistantError('unknown request kind')
     return result

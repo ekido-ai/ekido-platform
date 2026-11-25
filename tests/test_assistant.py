@@ -20,14 +20,20 @@ class StructuredOutput(unittest.TestCase):
 
     def test_a_proposal_names_exactly_one_known_recipe_and_no_kind(self):
         self.assertEqual(assistant.task_decision(self.task())['recipe_id'], 'review-sentiment')
-        for changes in ({'recipe_id': None}, {'recipe_id': '../invalid'}, {'recipe_id': 5}, {'kind': 'coding'}, {'language': 'fr'},
-                        {'language': []}, {'action': 'run'}):
+        extra = assistant.task_decision(self.task(kind='coding'))  # a stray known kind is dropped, not fatal
+        self.assertEqual((extra['recipe_id'], extra['kind']), ('review-sentiment', None))
+        for changes in ({'recipe_id': None}, {'recipe_id': '../invalid'}, {'recipe_id': 5}, {'kind': 'something else'},
+                        {'language': 'fr'}, {'language': []}, {'action': 'run'}):
             with self.subTest(changes=changes), self.assertRaises(assistant.AssistantError):
                 assistant.task_decision(self.task(**changes))
 
     def test_a_clarification_selects_nothing(self):
         self.assertEqual(assistant.task_decision(self.task(action='clarify', recipe_id=None))['action'], 'clarify')
-        for changes in ({'recipe_id': 'review-sentiment'}, {'kind': 'coding'}):
+        for stray in ({'recipe_id': 'review-sentiment'}, {'kind': 'coding'}):
+            with self.subTest(stray=stray):
+                result = assistant.task_decision(self.task(**{'action': 'clarify', 'recipe_id': None, **stray}))
+                self.assertEqual((result['recipe_id'], result['kind']), (None, None))
+        for changes in ({'recipe_id': 'not-a-recipe'}, {'kind': 'something else'}, {'kind': 7}):
             with self.subTest(changes=changes), self.assertRaises(assistant.AssistantError):
                 assistant.task_decision(self.task(**{'action': 'clarify', 'recipe_id': None, **changes}))
 
