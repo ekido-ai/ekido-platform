@@ -336,6 +336,54 @@ class SettleAndRefundTests(Base):
         with self.assertRaises(PaymentError):
             self.rail.settle(self.session, order.id, self.split())  # a refunded order can never be settled
 
+    def test_a_crash_between_the_gateway_refund_and_our_record_is_recovered_without_asking_razorpay_again(self):
+        order, pid = self.paid()
+        # Razorpay refunded, then the process died before we wrote the ledger: the order is still HELD here.
+        self.gateway.refund_payment(pid, order.amount_paise, receipt="refund-from-before-the-crash")
+        self.assertEqual(self.gateway.calls.count("refund_payment"), 1)
+        self.rail.refund(self.session, order.id)
+        self.session.refresh(order)
+        self.assertEqual(order.status, REFUNDED)
+        self.assertEqual(self.gateway.calls.count("refund_payment"), 1)  # recorded, not requested again
+        self.assertEqual(sum(v for _, _, v in self.entries(order)), 0)  # capture and refund cancel out
+        self.assertEqual(len([e for e in self.entries(order) if e[0] == "REFUND"]), 1)
+        self.rail.refund(self.session, order.id)  # and repeating is still a no-op
+        self.assertEqual(len([e for e in self.entries(order) if e[0] == "REFUND"]), 1)
+
+    def test_a_partly_refunded_payment_is_left_for_a_person_and_nothing_is_refunded_again(self):
+        order, pid = self.paid()
+        self.gateway.payments[pid]["amount_refunded"] = 100
+        with self.assertRaises(PaymentError) as caught:
+            self.rail.refund(self.session, order.id)
+        self.assertEqual((caught.exception.code, caught.exception.status), ("PARTIAL_REFUND", 409))
+        self.session.refresh(order)
+        self.assertEqual((order.status, len(self.entries(order))), (HELD, 1))
+        self.assertNotIn("refund_payment", self.gateway.calls)
+
+    def test_a_payment_that_does_not_match_the_order_is_never_refunded(self):
+        for field, value in (("amount", 1), ("order_id", "order_other"), ("currency", "USD"), ("id", "pay_other")):
+            with self.subTest(field):
+                self.setUp()
+                order, pid = self.paid()
+                self.gateway.payments[pid][field] = value
+                with self.assertRaises(PaymentError) as caught:
+                    self.rail.refund(self.session, order.id)
+                self.assertEqual(caught.exception.code, "GATEWAY_MISMATCH")
+                self.assertNotIn("refund_payment", self.gateway.calls)
+
+    def test_if_razorpay_cannot_be_reached_to_check_nothing_is_refunded_and_a_retry_works(self):
+        order, _ = self.paid()
+        self.gateway.unreachable = True
+        with self.assertRaises(PaymentError):
+            self.rail.refund(self.session, order.id)
+        self.assertNotIn("refund_payment", self.gateway.calls)
+        self.session.refresh(order)
+        self.assertEqual(order.status, HELD)
+        self.gateway.unreachable = False
+        self.rail.refund(self.session, order.id)
+        self.session.refresh(order)
+        self.assertEqual(order.status, REFUNDED)
+
     def test_a_settled_order_cannot_be_refunded(self):
         order, _ = self.paid()
         self.rail.settle(self.session, order.id, self.split())

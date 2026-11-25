@@ -329,9 +329,21 @@ class RazorpayRail:
             return order
         if order.status != HELD or not order.gateway_payment_id:
             raise PaymentError("NOT_HELD", f"only a paid order can be refunded; this one is {order.status}", 409)
-        remote = self.gateway.refund_payment(order.gateway_payment_id, order.amount_paise, receipt=f"refund-{order.id}")  # raises: stays HELD, retry later
-        if remote.get("amount") != order.amount_paise:
-            raise PaymentError("GATEWAY_MISMATCH", "Razorpay refunded a different amount than was asked", 502)
+        # Ask Razorpay first. A crash between "Razorpay refunded" and "we recorded it" would otherwise leave the order HELD with the money
+        # already returned, and every retry would fail at Razorpay. If the payment is already refunded in full, just record that.
+        payment = self.gateway.fetch_payment(order.gateway_payment_id)  # raises: stays HELD, retry later
+        if not (payment.get("id") == order.gateway_payment_id and payment.get("order_id") == order.gateway_order_id
+                and payment.get("amount") == order.amount_paise and payment.get("currency") == order.currency):
+            raise PaymentError("GATEWAY_MISMATCH", "the payment at Razorpay does not match this order", 502)
+        already = payment.get("amount_refunded") or 0
+        if already == order.amount_paise:
+            log.warning("order %s was already refunded at Razorpay; recording it without asking again", order.id)
+        elif already:
+            raise PaymentError("PARTIAL_REFUND", f"Razorpay has already refunded {already} of {order.amount_paise} paise; a person must settle this order", 409)
+        else:
+            remote = self.gateway.refund_payment(order.gateway_payment_id, order.amount_paise, receipt=f"refund-{order.id}")  # raises: stays HELD, retry later
+            if remote.get("amount") != order.amount_paise:
+                raise PaymentError("GATEWAY_MISMATCH", "Razorpay refunded a different amount than was asked", 502)
         self._add(session, order, "REFUND", "", -order.amount_paise)
         order.status = REFUNDED
         log.info("order %s refunded: %s", order.id, reason)
