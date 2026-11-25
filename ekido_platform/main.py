@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     # run the evaluation sets, which send more than 20 messages in ten minutes.
     assistant_rate_limit: int = Field(default=20, ge=1, le=100_000)
     assistant_rate_window: int = Field(default=600, ge=1, le=86_400)
+    assistant_refusal_limit: int = Field(default=5, ge=1, le=100_000)  # refusals per person per hour before the assistant pauses
     # Emails allowed into the owner's admin area (ticket C26). Empty keeps it closed to everyone.
     admin_emails: list[str] = []
     # Razorpay, test mode only (ticket C7). The key id is public; the secret and the webhook secret come from the environment
@@ -115,10 +116,11 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
                                                    v1_admin.coordinator_client(settings.coordinator_url, settings.coordinator_token),
                                                    payment_rail=lambda: getattr(app.state, "payment_rail", None)))
 
-    from .v1_assistant import RateLimit, build_assistant_router
+    from .v1_assistant import RateLimit, RefusalBreaker, build_assistant_router
     app.include_router(build_assistant_router(engine, principal, settings.assistant_engine_url,
         settings.assistant_state_secret, guard_url=settings.assistant_guard_url, transport=assistant_transport,
-        limiter=RateLimit(settings.assistant_rate_limit, settings.assistant_rate_window)))
+        limiter=RateLimit(settings.assistant_rate_limit, settings.assistant_rate_window),
+        breaker=RefusalBreaker(settings.assistant_refusal_limit)))
 
     from .payments import RazorpayHttpGateway, RazorpayRail
     from .v1_payments import build_payments_router

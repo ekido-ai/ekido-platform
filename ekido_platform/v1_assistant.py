@@ -33,6 +33,7 @@ from ekido_core.recipes import RECIPES
 
 from . import accounts
 from .accounts import AccountError, Principal
+from .assistant_language import detect_language
 from .assistant import AssistantError, guard_decision, policy_decision, task_decision
 from .assistant_cards import CARDS_VERSION
 from .assistant_model import AssistantModel, GuardModel, POLICY_SCHEMA, POLICY_SYSTEM, TASK_SCHEMA, TASK_SYSTEM
@@ -170,8 +171,42 @@ class RateLimit:
             return True
 
 
+class RefusalBreaker:
+    """After `limit` refused requests from one person within `window` seconds, stop answering them for the rest of the window, so the
+    screening models cannot be probed over and over. In this process, like RateLimit."""
+
+    def __init__(self, limit: int = 5, window: int = 3600, max_people: int = 10_000):
+        self.limit, self.window, self.max_people = limit, window, max_people
+        self.refused: dict[str, deque] = {}
+        self.lock = threading.Lock()
+
+    def _recent(self, subject: str, now: float) -> deque:
+        times = self.refused.get(subject, deque())
+        while times and now - times[0] > self.window:
+            times.popleft()
+        return times
+
+    def open(self, subject: str, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            return len(self._recent(subject, now)) >= self.limit
+
+    def record(self, subject: str, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            if subject not in self.refused and len(self.refused) >= self.max_people:
+                for key in [k for k, q in self.refused.items() if not q or now - q[-1] > self.window]:
+                    del self.refused[key]
+                if len(self.refused) >= self.max_people:
+                    return
+            times = self._recent(subject, now)
+            times.append(now)
+            self.refused[subject] = times
+
+
 def build_assistant_router(engine: Engine, principal: Callable, engine_url: str, state_secret: str, *,
-                           guard_url: str = '', transport=None, limiter: RateLimit | None = None) -> APIRouter:
+                           guard_url: str = '', transport=None, limiter: RateLimit | None = None,
+                           breaker: RefusalBreaker | None = None) -> APIRouter:
     router = APIRouter(prefix='/v1')
     try:
         model = AssistantModel(engine_url, transport=transport) if engine_url else None
@@ -183,6 +218,7 @@ def build_assistant_router(engine: Engine, principal: Callable, engine_url: str,
         guard = None
     permits = threading.BoundedSemaphore(2)
     limiter = limiter or RateLimit()
+    breaker = breaker or RefusalBreaker()
 
     def team_of(who: Principal, org_id: str | None) -> str:
         if who.via == 'api_key':
@@ -214,24 +250,30 @@ def build_assistant_router(engine: Engine, principal: Callable, engine_url: str,
         subject = _subject(who)
         if not limiter.allow(subject):
             raise AccountError('RATE_LIMITED', 'Too many assistant messages. Try again in a few minutes.', 429)
+        if breaker.open(subject):
+            raise AccountError('ASSISTANT_PAUSED', 'Several requests were refused, so the assistant is paused for you for a while.', 429)
         state = _decode(body.conversation_id, state_secret, subject) if body.conversation_id else {
             'subject': subject, 'expires': int(time.time()) + 1800, 'recipe_id': None, 'language': 'en'}
         if not permits.acquire(blocking=False):
             raise AccountError('ASSISTANT_BUSY', 'Assistant is busy. Try again.', 503)
+        spoken = detect_language(body.message)  # by script and common words: the model often mislabels Hinglish as Hindi
         try:
             # 1. Qwen3Guard, a separate model trained for safety (G1). 2. Our own policy check. Both must allow.
             screened, _ = guard_decision(guard.classify(body.message))
             decision = screened if screened != 'allow' else policy_decision(model.decide(POLICY_SYSTEM, body.message, POLICY_SCHEMA))
             if decision != 'allow':
+                if decision == 'refuse':
+                    breaker.record(subject)
+                state['language'] = spoken
                 return {'conversation_id': _encode(state, state_secret), 'refused': decision,
-                        'reply': REPLIES[state['language']][decision], 'cards_version': CARDS_VERSION}
+                        'reply': REPLIES[spoken][decision], 'cards_version': CARDS_VERSION}
             context = f"Previously selected recipe: {state['recipe_id'] or 'none'}.\nCurrent message:\n{body.message}"
             task = task_decision(model.decide(TASK_SYSTEM, context, TASK_SCHEMA))
         except AssistantError:
             raise AccountError('ASSISTANT_UNAVAILABLE', 'Assistant could not safely process this request.', 503) from None
         finally:
             permits.release()
-        language = state['language'] = task['language']
+        language = state['language'] = spoken
         replies = REPLIES[language]
         answer = {'language': language, 'cards_version': CARDS_VERSION}
         if task['action'] == 'unsupported':
