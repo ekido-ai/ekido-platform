@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import io
 import json
+import urllib.parse
 import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -172,8 +173,43 @@ def export_zip(files: dict[str, Any]) -> bytes:
 # ---------------------------------------------------------------------------------------------------- delete
 
 
-def request_deletion(session: Session, user_id: str, org_erasers: list[OrgEraser] | None = None, now: datetime | None = None) -> DeletionRequest:
-    """Erase a person now and schedule the rest. All or nothing: if anything refuses or fails, nothing is deleted."""
+ENDED_JOB_STATES = frozenset({"SETTLED", "FAILED", "CANCELLED", "REFUNDED"})  # the Coordinator's own list of jobs that are over
+
+
+def refuse_while_jobs_run(coordinator: Callable[[], Any]) -> Callable[[list[str]], None]:
+    """A check for `request_deletion`: a team whose job is still running or being checked cannot be erased yet.
+
+    Erasing the team schedules its data for destruction, and the Coordinator destroys a job's key when told to, which would break the run
+    (the worker waits for the key; the verifier needs it). So the person is told to cancel the job or wait until it ends, and nothing is
+    deleted. Every job counts as running unless the Coordinator says it ended; a job the Coordinator does not know (404) has nothing to
+    protect. If the Coordinator cannot be asked, the deletion is refused for now (503), because destroying data mid-job cannot be undone
+    and asking again later is cheap.
+    """
+
+    def check(job_ids: list[str]) -> None:
+        running = 0
+        for job_id in job_ids:
+            try:
+                status, body = coordinator()("GET", f"/jobs/{urllib.parse.quote(job_id, safe='')}")
+            except OSError:
+                raise AccountError("JOB_CHECK_UNAVAILABLE", "We could not check whether your team has a job running. Nothing was deleted; please try again in a few minutes.", 503) from None
+            if status == 404:
+                continue
+            if status != 200 or not isinstance(body, dict):
+                raise AccountError("JOB_CHECK_UNAVAILABLE", "We could not check whether your team has a job running. Nothing was deleted; please try again in a few minutes.", 503)
+            if str(body.get("state", "")) not in ENDED_JOB_STATES:
+                running += 1
+        if running:
+            raise AccountError("JOB_RUNNING", f"Your team has {running} job{'s' if running != 1 else ''} still running or being checked. Cancel {'them' if running != 1 else 'it'} or wait until {'they end' if running != 1 else 'it ends'}, then ask again. Nothing was deleted.", 409)
+
+    return check
+
+
+def request_deletion(session: Session, user_id: str, org_erasers: list[OrgEraser] | None = None, now: datetime | None = None,
+                     job_checks: list[Callable[[list[str]], None]] | None = None) -> DeletionRequest:
+    """Erase a person now and schedule the rest. All or nothing: if anything refuses or fails, nothing is deleted.
+
+    `job_checks` run first, with the ids of the jobs of every team that would be erased; one of them raises to refuse (see `refuse_while_jobs_run`)."""
     now = now or utcnow()
     user = session.get(User, user_id)
     if user is None:
@@ -191,6 +227,10 @@ def request_deletion(session: Session, user_id: str, org_erasers: list[OrgEraser
             other_owners = session.scalar(select(func.count()).select_from(OrgMember).where(OrgMember.org_id == member.org_id, OrgMember.role == "owner", OrgMember.user_id != user_id))
             if other_owners == 0:
                 raise AccountError("OWNER_OF_SHARED_TEAM", "You are the only owner of a team that has other people. Make someone else an owner, or remove them, first.", 409)
+    if erase_orgs and job_checks:
+        job_ids = list(session.scalars(select(JobOwner.job_id).where(JobOwner.org_id.in_(erase_orgs)).order_by(JobOwner.job_id)))
+        for check in job_checks:
+            check(job_ids)  # raises AccountError to refuse; nothing has been changed yet
     try:
         request = DeletionRequest(user_id=user_id, due_at=now + ERASURE_WINDOW, status=SCHEDULED, created_at=now)
         session.add(request)
