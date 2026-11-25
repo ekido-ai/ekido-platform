@@ -86,7 +86,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
     engine = engine or create_engine_for(settings.database_url)
     # SQLite (tests): create the tables. Postgres: the schema belongs to the migrations in apps/platform/alembic,
     # which the service unit runs before it starts.
-    from . import payments, plans, privacy, v1_admin, v1_assistant, v1_datasets, v1_invoices  # noqa: F401  (register their tables before create_all)
+    from . import payments, plans, privacy, v1_admin, v1_assistant, v1_datasets, v1_distill, v1_invoices  # noqa: F401  (register their tables before create_all)
 
     if engine.dialect.name == "sqlite":
         Base.metadata.create_all(engine)
@@ -144,6 +144,10 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
 
     app.state.coordinator_post = coordinator_poster(settings.coordinator_url, settings.coordinator_token)  # tests replace this
     app.include_router(build_jobs_router(engine, principal, lambda *a: app.state.coordinator_post(*a)))
+    from .v1_distill import build_distill_router
+
+    # Ticket 154 (Platform half): few examples, generated rows, the customer approves before training.
+    app.include_router(build_distill_router(engine, principal, lambda *a: app.state.coordinator_post(*a), lambda: getattr(app.state, "payment_rail", None)))
     from .v1_customer_jobs import build_customer_jobs_router
 
     # Ticket C12: the customer's own jobs and models, allow-listed so no device identity ever reaches them.
@@ -181,7 +185,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
         session.execute(delete(plans.PlanUsage).where(plans.PlanUsage.org_id == org_id))
         session.execute(delete(plans.TeamPlan).where(plans.TeamPlan.org_id == org_id))
 
-    app.include_router(build_privacy_router(engine, principal, exporters={"payments": export_payments, "plans": export_plans}, org_erasers=[erase_plans],
+    app.include_router(build_privacy_router(engine, principal, exporters={"payments": export_payments, "plans": export_plans}, org_erasers=[erase_plans, v1_distill.erase_distillations],
                                             job_checks=[privacy.refuse_while_jobs_run(lambda: app.state.coordinator_get)]))
     @app.exception_handler(AccountError)
     async def account_refused(_: Request, exc: AccountError):

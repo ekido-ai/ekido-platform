@@ -80,6 +80,7 @@ class NewQuote(BaseModel):
     dataset_id: str = Field(max_length=36)
     base_model: str = Field(default=LLM_BASES[0], max_length=100)
     hosting_requests_per_month: int = Field(default=0, ge=0, le=10_000_000)
+    distill: bool = False  # ask for generated examples as well (the one quote then covers both steps)
 
 
 def recipe_view(r) -> dict[str, Any]:
@@ -219,9 +220,16 @@ def build_datasets_router(engine: Engine, principal: Callable, payment_rail: Cal
             raise AccountError("NOT_FOUND", "No such dataset.", 404)
         try:
             quote = make_quote(recipe_id=dataset.recipe_id, base_model=body.base_model, train_rows=dataset.train_rows, test_rows=dataset.test_rows,
-                               dataset_sha256=dataset.sha256, hosting_requests_per_month=body.hosting_requests_per_month)
+                               dataset_sha256=dataset.sha256, distill=body.distill, hosting_requests_per_month=body.hosting_requests_per_month)
         except QuoteError as exc:
             raise AccountError("QUOTE_REFUSED", str(exc), 422) from None
+        # The terms hash is unique and a quote is stamped to the second, so asking twice for the same data in one second (a double click)
+        # gives the same terms: return the quote that already exists instead of failing on the unique constraint.
+        existing = session.scalar(select(Quote).where(Quote.terms_hash == quote["terms_hash"]))
+        if existing is not None:
+            if existing.org_id != org_id:
+                raise AccountError("TRY_AGAIN", "Please ask for the quote again in a moment.", 409)  # never hand back another team's quote
+            return {"quote_id": existing.id, "dataset_id": existing.dataset_id, **existing.quote}
         row = Quote(id=str(uuid.uuid4()), org_id=org_id, dataset_id=dataset.id, terms_hash=quote["terms_hash"], quote=quote)
         session.add(row)
         session.commit()
