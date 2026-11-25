@@ -479,7 +479,7 @@ class Approving(Base):
         self.assertEqual(created["workload"]["dataset"]["test_rows"], 20)
         self.assertEqual(created["workload"]["dataset"]["sha256"], combined.sha256)
         self.assertEqual(created["budget_usdc"], f"{quote['provider_budget_paise'] / 100:.6f}")
-        self.assertEqual(self.coordinator.posted(f"/jobs/{job_id}/start")[0][0], "POST")
+        self.assertEqual(self.coordinator.posted(f"/jobs/{job_id}/activate")[0][0], "POST")
 
     def test_approving_twice_starts_one_job(self):
         _, did, _ = self.in_review()
@@ -519,7 +519,7 @@ class Approving(Base):
 
     def test_a_job_the_coordinator_refuses_to_start_is_cancelled_and_the_order_is_released(self):
         order_id, did, _ = self.in_review()
-        self.coordinator.refuse.add(f"/jobs/train-{self.coordinator.n + 1}/start")
+        self.coordinator.refuse.add(f"/jobs/train-{self.coordinator.n + 1}/activate")
         r = self.client("asha@example.com").post(self.url(did, "/approve"))
         self.assertGreaterEqual(r.status_code, 400)
         self.assertTrue(any(c[1].endswith("/cancel") for c in self.coordinator.calls))

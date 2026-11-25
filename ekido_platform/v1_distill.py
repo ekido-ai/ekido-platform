@@ -51,6 +51,7 @@ from .accounts import AccountError, JobOwner, Principal
 from .models import Base, Timestamped, utcnow
 from .payments import HELD, PaymentError, PaymentOrder
 from .v1_datasets import Dataset, Quote, dataset_bytes, recipe_job, split_rows
+from .v1_jobs import cancel_quietly
 
 GENERATING, REVIEW, APPROVED, TRAINING, REJECTED, FAILED = "GENERATING", "REVIEW", "APPROVED", "TRAINING", "REJECTED", "FAILED"
 SAMPLE_SIZE = 20
@@ -422,6 +423,7 @@ def build_distill_router(engine: Engine, principal: Callable, coordinator: Coord
             session.execute(update(PaymentOrder).where(PaymentOrder.id == order.id, PaymentOrder.job_id == claim).values(job_id=None))
             session.commit()
 
+        job_id = None
         try:
             spec, policy = _training_job(order.quote, combined)
             budget = (Decimal(order.quote["provider_budget_paise"]) / 100).quantize(Decimal("0.000001"))
@@ -429,11 +431,13 @@ def build_distill_router(engine: Engine, principal: Callable, coordinator: Coord
             if status not in (200, 201) or not isinstance(created, dict) or not created.get("job_id"):
                 raise AccountError("JOB_REFUSED", "The training job could not be created.", 422 if status in (400, 422) else 502)
             job_id = created["job_id"]
-            status, _ = post("POST", f"/jobs/{job_id}/start", None)
+            status, _ = post("POST", f"/jobs/{job_id}/activate", None)
             if status != 200:
                 post("POST", f"/jobs/{job_id}/cancel", None)
                 raise AccountError("JOB_REFUSED", "The training job could not be started.", 422 if status in (400, 409, 422) else 502)
         except OSError:
+            if job_id is not None:
+                cancel_quietly(post, job_id)
             release()
             raise AccountError("UNAVAILABLE", "The training service is not reachable. Nothing was charged again; try again.", 503) from None
         except AccountError:

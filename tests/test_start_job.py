@@ -24,7 +24,7 @@ BODY = {"workload": WORKLOAD, "policy": {"min": 1}}
 
 class FakeCoordinator:
     def __init__(self):
-        self.calls, self.create_status, self.start_status, self.down = [], 200, 200, False
+        self.calls, self.create_status, self.start_status, self.down, self.slow_start = [], 200, 200, False, False
 
     def __call__(self, method, path, body):
         self.calls.append((method, path, body))
@@ -32,7 +32,9 @@ class FakeCoordinator:
             raise OSError("down")
         if path == "/jobs":
             return self.create_status, ({"job_id": "job-1", "state": "OPEN"} if self.create_status == 200 else {"detail": "bad spec"})
-        if path.endswith("/start"):
+        if path.endswith("/activate"):
+            if self.slow_start:
+                raise TimeoutError("activation took too long")
             return self.start_status, ({"job_id": "job-1", "state": "ASSIGNED"} if self.start_status == 200 else {"detail": "not funded"})
         return 200, {}
 
@@ -86,9 +88,17 @@ class Start(Base):
         with Session(self.engine) as s:
             self.assertEqual(s.scalar(select(JobOwner.org_id).where(JobOwner.job_id == "job-1")), org)
         (m1, p1, b1), (m2, p2, _) = self.coordinator.calls
-        self.assertEqual((m1, p1, p2), ("POST", "/jobs", "/jobs/job-1/start"))
+        self.assertEqual((m1, p1, p2), ("POST", "/jobs", "/jobs/job-1/activate"))
         self.assertEqual(b1["budget_usdc"], f"{q['provider_budget_paise'] / 100:.6f}")
         self.assertEqual(b1["workload"], BODY["workload"])
+
+    def test_an_activation_that_times_out_cancels_the_job_and_frees_the_order(self):
+        org = self.org()
+        order_id, _ = self.order(org)
+        self.coordinator.slow_start = True
+        self.assertEqual(self.start("asha@example.com", org, order_id).status_code, 503)
+        self.assertEqual([c[1] for c in self.coordinator.calls], ["/jobs", "/jobs/job-1/activate", "/jobs/job-1/cancel"])
+        self.assertIsNone(self.order_row(order_id))
 
     def test_a_second_start_from_the_same_order_is_refused_and_calls_nothing(self):
         org = self.org()

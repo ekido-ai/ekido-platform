@@ -36,7 +36,7 @@ class Flow(unittest.TestCase):
                 return 201, {"sha256": path.rsplit("/", 1)[1], "bytes": len(body)}
             if method == "POST" and path == "/jobs":
                 return 201, {"job_id": "00000000-0000-4000-8000-0000000000aa", "state": "OPEN"}
-            if method == "POST" and path.endswith("/start"):
+            if method == "POST" and path.endswith("/activate"):
                 return 200, {"state": "ASSIGNED"}
             return 404, {"detail": "not found"}
 
