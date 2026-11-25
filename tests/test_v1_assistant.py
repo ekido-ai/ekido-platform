@@ -249,9 +249,15 @@ class RouteRateLimit(AssistantRoute):
     """The default is the product's limit: 20 messages per person per 10 minutes."""
 
     def test_the_twenty_first_message_in_a_window_is_refused_with_429(self):
-        self.policy = 'refuse'  # the cheapest path: the guard and our policy check, never the task model
+        self.policy = 'review'  # the cheapest path that is not a refusal: refusals have their own, lower limit
         codes = [self.post('hello').status_code for _ in range(21)]
         self.assertEqual(codes, [200] * 20 + [429])
+
+    def test_after_five_refusals_the_assistant_pauses_for_that_person(self):
+        self.policy = 'refuse'
+        responses = [self.post('hello') for _ in range(6)]
+        self.assertEqual([r.status_code for r in responses], [200] * 5 + [429])
+        self.assertEqual(responses[-1].json()['error'], 'ASSISTANT_PAUSED')
 
     def test_the_limit_is_a_validated_setting(self):
         self.assertEqual((Settings(_env_file=None).assistant_rate_limit, Settings(_env_file=None).assistant_rate_window), (20, 600))
