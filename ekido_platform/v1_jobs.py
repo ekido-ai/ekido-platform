@@ -45,6 +45,10 @@ class StartJob(BaseModel):
     deadline_seconds: int = Field(default=86_400, gt=0, le=7 * 24 * 3600)
 
 
+# Starting a job makes the Coordinator probe real devices before it answers, which takes minutes, not seconds.
+ACTIVATE_TIMEOUT = 300.0
+
+
 def coordinator_poster(base_url: str, token: str, timeout: float = 20.0) -> CoordinatorPost:
     """Calls the Coordinator's operator API with a JSON body. No redirects; replies are capped at 2 MB."""
 
@@ -62,7 +66,7 @@ def coordinator_poster(base_url: str, token: str, timeout: float = 20.0) -> Coor
         if token:
             request.add_header("Authorization", f"Bearer {token}")
         try:
-            with opener.open(request, timeout=timeout) as response:
+            with opener.open(request, timeout=ACTIVATE_TIMEOUT if path.endswith("/activate") else timeout) as response:
                 status, raw = response.status, response.read(2_000_001)
         except urllib.error.HTTPError as error:
             status, raw = error.code, error.read(2_000_001)
@@ -174,6 +178,7 @@ def build_jobs_router(engine: Engine, principal: Callable, coordinator: Coordina
         if taken.rowcount != 1:
             raise AccountError("ALREADY_STARTED", "A job has already been started from this order.", 409)
         budget = (Decimal(order.quote["provider_budget_paise"]) / 100).quantize(Decimal("0.000001"))
+        job_id = None
         try:
             if dataset_blob is not None:
                 # The providers fetch the rows by hash from the Coordinator's store; it re-checks the hash on write.
@@ -184,11 +189,13 @@ def build_jobs_router(engine: Engine, principal: Callable, coordinator: Coordina
             if status != 200 and status != 201 or not isinstance(created, dict) or not created.get("job_id"):
                 raise AccountError("JOB_REFUSED", "The job could not be created: " + _reason(created), 422 if status in (400, 422) else 502)
             job_id = created["job_id"]
-            status, started = coordinator("POST", f"/jobs/{job_id}/start", None)
+            status, started = coordinator("POST", f"/jobs/{job_id}/activate", None)
             if status != 200:
                 coordinator("POST", f"/jobs/{job_id}/cancel", None)  # best effort: do not leave a job that was never paid for to start later
                 raise AccountError("JOB_REFUSED", "The job could not be started: " + _reason(started), 422 if status in (400, 409, 422) else 502)
         except OSError:
+            if job_id is not None:  # activation timed out: cancel it, or it could start later beside the customer's retry
+                cancel_quietly(coordinator, job_id)
             release(session, order.id, claim)
             raise AccountError("UNAVAILABLE", "The training service is not reachable. Nothing was charged again; try again.", 503) from None
         except AccountError:
@@ -200,6 +207,14 @@ def build_jobs_router(engine: Engine, principal: Callable, coordinator: Coordina
         return {"job_id": job_id, "order_id": order.id, "state": (started or {}).get("state")}
 
     return router
+
+
+def cancel_quietly(post: CoordinatorPost, job_id: str) -> None:
+    """Best effort: the Coordinator may be the thing that is unreachable."""
+    try:
+        post("POST", f"/jobs/{job_id}/cancel", None)
+    except OSError:
+        pass
 
 
 def _reason(body: Any) -> str:
