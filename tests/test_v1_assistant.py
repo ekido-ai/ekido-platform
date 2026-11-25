@@ -216,10 +216,13 @@ class GuardStep(AssistantRoute):
         self.assertNotIn('Jailbreak', response.text)  # categories stay on the server
         self.assertEqual(self.calls, [])
 
-    def test_controversial_goes_to_review(self):
+    def test_an_unsure_guard_leaves_the_decision_to_our_policy_check(self):
         self.guard = 'Safety: Controversial\nCategories: Politically Sensitive Topics'
-        self.assertEqual(self.post('a borderline request').json()['refused'], 'review')
-        self.assertEqual(self.calls, [])
+        self.assertIn('proposal', self.post('mere ticket sort karne hain').json())  # the policy check allows it
+        for decision in ('refuse', 'review'):
+            with self.subTest(decision):
+                self.policy = decision
+                self.assertEqual(self.post('a borderline request').json()['refused'], decision)
 
     def test_safe_still_needs_our_policy_check_to_allow(self):
         self.policy = 'refuse'

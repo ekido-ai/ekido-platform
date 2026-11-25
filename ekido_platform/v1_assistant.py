@@ -258,9 +258,10 @@ def build_assistant_router(engine: Engine, principal: Callable, engine_url: str,
             raise AccountError('ASSISTANT_BUSY', 'Assistant is busy. Try again.', 503)
         spoken = detect_language(body.message)  # by script and common words: the model often mislabels Hinglish as Hindi
         try:
-            # 1. Qwen3Guard, a separate model trained for safety (G1). 2. Our own policy check. Both must allow.
+            # 1. Qwen3Guard, a separate model trained for safety (G1). 2. Our own policy check. "Unsafe" stops here. "Unsure" goes on:
+            # the policy check decides (Piyush, 25 Nov: the guard blocked ordinary invoice requests as unsure).
             screened, _ = guard_decision(guard.classify(body.message))
-            decision = screened if screened != 'allow' else policy_decision(model.decide(POLICY_SYSTEM, body.message, POLICY_SCHEMA))
+            decision = 'refuse' if screened == 'refuse' else policy_decision(model.decide(POLICY_SYSTEM, body.message, POLICY_SCHEMA))
             if decision != 'allow':
                 if decision == 'refuse':
                     breaker.record(subject)
