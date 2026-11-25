@@ -118,5 +118,59 @@ class AccountsTest(unittest.TestCase):
                 accounts.create_api_key(self.session, org.id, owner.id, *bad)
 
 
+    def test_the_limit_says_how_long_to_wait(self):
+        start = utcnow()
+        for minute in range(accounts.LOGIN_LINKS_PER_HOUR):
+            accounts.start_login(self.session, "a@b.co", now=start + timedelta(minutes=minute))
+        # Ten minutes in, the first link leaves the one-hour window at minute 60: 50 minutes to go.
+        with self.assertRaises(AccountError) as limited:
+            accounts.start_login(self.session, "a@b.co", now=start + timedelta(minutes=10))
+        error = limited.exception
+        self.assertEqual((error.code, error.status, error.extra["retry_after"]), ("TOO_MANY_LINKS", 429, 50 * 60))
+        self.assertIn("in 50 minutes", error.detail)
+        # An invite to the same address talks about invites, not sign-in links.
+        with self.assertRaises(AccountError) as invite:
+            accounts.check_link_quota(self.session, "a@b.co", now=start + timedelta(minutes=59, seconds=30), purpose="invite")
+        self.assertEqual((invite.exception.code, invite.exception.extra["retry_after"]), ("TOO_MANY_INVITES", 60))
+        self.assertIn("send the invite again in a minute", invite.exception.detail)
+        self.assertNotIn("sign-in", invite.exception.detail)
+        # After the hour, links flow again.
+        accounts.start_login(self.session, "a@b.co", now=start + timedelta(minutes=61))
+
+    def test_an_invite_is_pending_until_the_person_signs_in(self):
+        owner, _ = self.sign_in("owner@x.co")
+        org = accounts.create_org(self.session, owner.id, "Shop")
+        staff = accounts.add_member(self.session, org.id, "staff@x.co", "member")
+        members = {m["email"]: m for m in accounts.org_view(self.session, org.id)["members"]}
+        self.assertEqual(members["owner@x.co"]["status"], "joined")
+        self.assertIsNotNone(members["owner@x.co"]["joined_at"])
+        self.assertEqual((members["staff@x.co"]["status"], members["staff@x.co"]["joined_at"]), ("invited", None))
+        self.assertIsNotNone(members["staff@x.co"]["invited_at"])
+
+        # Re-inviting changes the role and keeps them pending; signing in (the invite link is a sign-in link) joins.
+        accounts.add_member(self.session, org.id, "staff@x.co", "admin")
+        self.assertEqual([m["status"] for m in accounts.org_view(self.session, org.id)["members"]], ["joined", "invited"])
+        user, _ = self.sign_in("staff@x.co")
+        self.assertEqual(user.id, staff)
+        joined = accounts.org_view(self.session, org.id)["members"][1]
+        self.assertEqual((joined["status"], joined["role"]), ("joined", "admin"))
+        self.assertIsNotNone(joined["joined_at"])
+
+    def test_a_member_who_already_joined_stays_joined_when_re_invited(self):
+        owner, _ = self.sign_in("owner@x.co")
+        org = accounts.create_org(self.session, owner.id, "Shop")
+        accounts.add_member(self.session, org.id, "staff@x.co", "member")
+        self.sign_in("staff@x.co")
+        accounts.add_member(self.session, org.id, "staff@x.co", "admin")
+        self.assertEqual(accounts.org_view(self.session, org.id)["members"][1]["status"], "joined")
+
+    def test_an_invite_names_the_inviter(self):
+        owner, _ = self.sign_in("owner@x.co")
+        self.assertEqual(accounts.inviter_label(self.session, owner.id), "owner@x.co")
+        owner.display_name = "Asha Rao"
+        self.session.commit()
+        self.assertEqual(accounts.inviter_label(self.session, owner.id), "Asha Rao")
+
+
 if __name__ == "__main__":
     unittest.main()

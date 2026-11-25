@@ -82,6 +82,35 @@ class V1Accounts(unittest.TestCase):
         last = self.client.delete(f"/v1/orgs/{org}/members/{owner_id}")
         self.assertEqual((last.status_code, last.json()["error"]), (409, "LAST_OWNER"))
 
+    def test_an_invited_member_shows_as_invited_until_they_use_the_link(self):
+        self.sign_in("owner@x.co")
+        org = self.client.post("/v1/orgs", json={"name": "Shop"}).json()["org_id"]
+        with self.assertLogs("ekido_platform.v1_accounts", level="WARNING") as logs:
+            self.client.post(f"/v1/orgs/{org}/members", json={"email": "staff@x.co", "role": "member"})
+        self.assertIn("invite to Shop for staff@x.co", logs.output[-1])
+        members = self.client.get(f"/v1/orgs/{org}").json()["members"]
+        self.assertEqual([(m["email"], m["status"]) for m in members], [("owner@x.co", "joined"), ("staff@x.co", "invited")])
+
+        invitee = TestClient(self.client.app)
+        token = re.search(r"token=([\w-]+)", logs.output[-1]).group(1)
+        self.assertEqual(invitee.post("/v1/auth/email/verify", json={"token": token}).status_code, 200)
+        members = self.client.get(f"/v1/orgs/{org}").json()["members"]
+        self.assertEqual([m["status"] for m in members], ["joined", "joined"])
+
+    def test_a_refused_invite_says_when_to_retry_and_adds_nobody(self):
+        self.sign_in("owner@x.co")
+        org = self.client.post("/v1/orgs", json={"name": "Shop"}).json()["org_id"]
+        for _ in range(5):
+            self.link_token("busy@x.co")
+        refused = self.client.post(f"/v1/orgs/{org}/members", json={"email": "busy@x.co", "role": "member"})
+        body = refused.json()
+        self.assertEqual((refused.status_code, body["error"]), (429, "TOO_MANY_INVITES"))
+        self.assertGreater(body["retry_after"], 0)
+        self.assertEqual(refused.headers["retry-after"], str(body["retry_after"]))
+        self.assertIn("retry_at", body)
+        self.assertIn("send the invite again in", body["detail"])
+        self.assertNotIn("busy@x.co", [m["email"] for m in self.client.get(f"/v1/orgs/{org}").json()["members"]])
+
     def test_someone_elses_team_looks_missing(self):
         self.sign_in("a@x.co")
         org = self.client.post("/v1/orgs", json={"name": "A"}).json()["org_id"]
