@@ -33,6 +33,7 @@ from ekido_core.recipes import RECIPES
 
 from . import accounts
 from .accounts import AccountError, Principal
+from .assistant_language import detect_language
 from .assistant import AssistantError, guard_decision, policy_decision, task_decision
 from .assistant_cards import CARDS_VERSION
 from .assistant_model import AssistantModel, GuardModel, POLICY_SCHEMA, POLICY_SYSTEM, TASK_SCHEMA, TASK_SYSTEM
@@ -218,20 +219,22 @@ def build_assistant_router(engine: Engine, principal: Callable, engine_url: str,
             'subject': subject, 'expires': int(time.time()) + 1800, 'recipe_id': None, 'language': 'en'}
         if not permits.acquire(blocking=False):
             raise AccountError('ASSISTANT_BUSY', 'Assistant is busy. Try again.', 503)
+        spoken = detect_language(body.message)  # by script and common words: the model often mislabels Hinglish as Hindi
         try:
             # 1. Qwen3Guard, a separate model trained for safety (G1). 2. Our own policy check. Both must allow.
             screened, _ = guard_decision(guard.classify(body.message))
             decision = screened if screened != 'allow' else policy_decision(model.decide(POLICY_SYSTEM, body.message, POLICY_SCHEMA))
             if decision != 'allow':
+                state['language'] = spoken
                 return {'conversation_id': _encode(state, state_secret), 'refused': decision,
-                        'reply': REPLIES[state['language']][decision], 'cards_version': CARDS_VERSION}
+                        'reply': REPLIES[spoken][decision], 'cards_version': CARDS_VERSION}
             context = f"Previously selected recipe: {state['recipe_id'] or 'none'}.\nCurrent message:\n{body.message}"
             task = task_decision(model.decide(TASK_SYSTEM, context, TASK_SCHEMA))
         except AssistantError:
             raise AccountError('ASSISTANT_UNAVAILABLE', 'Assistant could not safely process this request.', 503) from None
         finally:
             permits.release()
-        language = state['language'] = task['language']
+        language = state['language'] = spoken
         replies = REPLIES[language]
         answer = {'language': language, 'cards_version': CARDS_VERSION}
         if task['action'] == 'unsupported':

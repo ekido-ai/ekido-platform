@@ -79,8 +79,12 @@ class AssistantRoute(unittest.TestCase):
     def post(self, message='sort support tickets', **extra):
         return self.client.post(self.url, headers=self.headers, json={'message': message, **extra})
 
+    def test_the_message_decides_the_reply_language_not_the_model(self):
+        body = self.post('sort my support tickets please').json()  # English, though the model says hinglish
+        self.assertEqual(body['language'], 'en')
+
     def test_a_proposal_names_the_recipe_and_asks_for_an_upload_and_never_builds_a_spec(self):
-        response = self.post()
+        response = self.post('mere support tickets sort karne hain')
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         recipe = RECIPES['ticket-sorter-hinglish']
