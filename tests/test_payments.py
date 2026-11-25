@@ -52,6 +52,8 @@ class FakeGateway:
         self.calls.append("fetch_payment")
         if self.unreachable:
             raise PaymentError("GATEWAY_UNREACHABLE", "Razorpay could not be reached", 502)
+        if payment_id not in self.payments:
+            raise PaymentError("GATEWAY_REFUSED", "no such payment", 400)  # as the real gateway answers an unknown id
         return dict(self.payments[payment_id])
 
     def refund_payment(self, payment_id, amount_paise, *, receipt):
@@ -432,6 +434,29 @@ class ReconcileTests(Base):
         self.assertEqual(report.amount_mismatch, [wrong.id])
         self.assertEqual(report.refund_mismatch, [refunded_here.id])
         self.assertEqual(report.missing_at_gateway, [vanished.id])
+
+    def test_a_payment_the_list_has_not_caught_up_with_is_confirmed_directly_and_not_called_missing(self):
+        # Seen on Razorpay test mode on 25 Nov: a payment made 18 seconds earlier was not in the payment list yet, but could be fetched.
+        fresh, pid = self.paid_other(rows=130)
+        listed = self.gateway.list_payments
+        self.gateway.list_payments = lambda **kw: [p for p in listed(**kw) if p["id"] != pid]
+        report = self.run_report()
+        self.assertEqual(report.missing_at_gateway, [])
+        self.assertTrue(report.ok, report.as_dict())
+
+    def test_a_direct_answer_that_disagrees_is_still_reported_as_missing(self):
+        listed = self.gateway.list_payments
+        for number, change in enumerate(({"amount": 1}, {"order_id": "order_other"}, {"status": "failed"}, {"status": "refunded"}, None)):
+            with self.subTest(change):
+                self.setUp()
+                listed = self.gateway.list_payments
+                order, pid = self.paid_other(rows=131 + number)
+                self.gateway.list_payments = lambda **kw: []
+                if change is None:
+                    self.gateway.unreachable = True
+                else:
+                    self.gateway.payments[pid].update(change)
+                self.assertEqual(self.run_report().missing_at_gateway, [order.id])
 
     def test_an_unbalanced_ledger_is_reported(self):
         order, _ = self.paid()
