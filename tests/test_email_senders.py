@@ -6,6 +6,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from ekido_platform.main import Settings, create_app
+from ekido_platform.emails import Invite, invite_html, invite_subject, invite_text
 from ekido_platform.v1_accounts import SesEmail, SmtpEmail
 
 SITE = "https://ekido.example"
@@ -37,6 +38,14 @@ class FakeSmtp:
 
     def send_message(self, message):
         FakeSmtp.sent.append(message)
+
+
+class RecordingSes:
+    def __init__(self):
+        self.calls = []
+
+    def send_email(self, **kwargs):
+        self.calls.append(kwargs)
 
 
 class RejectingSes:
@@ -83,6 +92,40 @@ class Senders(unittest.TestCase):
         with self.assertLogs("ekido_platform.v1_accounts", level="WARNING"):
             response = client.post("/v1/auth/email/start", json={"email": "someone@example.com"})
         self.assertEqual((response.status_code, response.json()["error"]), (503, "EMAIL_NOT_SENT"))
+
+    def test_an_invite_names_the_team_and_inviter_and_has_one_button(self):
+        invite = Invite(team="Asha's Clinic", inviter="asha@example.com", role="admin", site_url=SITE)
+        link = f"{SITE}/login/verify?token=abc"
+        self.assertEqual(invite_subject(invite), "asha@example.com invited you to Asha's Clinic on Ekido")
+        text = invite_text(invite, link)
+        for part in ("asha@example.com invited you to join Asha's Clinic", "as an admin", link, f"{SITE}/login", "15 minutes"):
+            self.assertIn(part, text)
+        page = invite_html(invite, link)
+        self.assertEqual(page.count(f'href="{link}"'), 2)  # the button, and the paste-this-link fallback
+        self.assertIn("Join Asha&#x27;s Clinic", page)
+        self.assertIn("an admin", page)
+
+    def test_an_invite_escapes_what_people_typed(self):
+        invite = Invite(team='<script>alert(1)</script>\nBcc: x@evil.co', inviter='Eve "<b>"', role="member", site_url=SITE)
+        page = invite_html(invite, f"{SITE}/login/verify?token=abc")
+        self.assertNotIn("<script>", page)
+        self.assertNotIn("<b>", page)
+        self.assertNotIn("\n", invite_subject(invite))
+        self.assertNotIn("\nBcc", invite_text(invite, "x"))
+
+    def test_smtp_sends_an_invite_as_text_and_html(self):
+        invite = Invite(team="Shop", inviter="owner@x.co", role="member", site_url=SITE)
+        self.smtp().send_invite("staff@x.co", f"{SITE}/login/verify?token=abc", invite)
+        message = FakeSmtp.sent[0]
+        self.assertEqual(message["Subject"], "owner@x.co invited you to Shop on Ekido")
+        self.assertEqual([part.get_content_type() for part in message.iter_parts()], ["text/plain", "text/html"])
+
+    def test_ses_sends_an_invite_as_text_and_html(self):
+        ses = RecordingSes()
+        SesEmail("Ekido <team@example.com>", client=ses).send_invite("staff@x.co", f"{SITE}/login/verify?token=abc", Invite("Shop", "owner@x.co", "member", SITE))
+        message = ses.calls[0]["Message"]
+        self.assertEqual(message["Subject"]["Data"], "owner@x.co invited you to Shop on Ekido")
+        self.assertEqual(sorted(message["Body"]), ["Html", "Text"])
 
     def test_smtp_is_chosen_from_settings(self):
         with mock.patch("ekido_platform.main.SmtpEmail") as smtp:

@@ -18,8 +18,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from . import accounts
+from . import accounts, emails
 from .accounts import AccountError, Principal
+from .emails import Invite
 
 COOKIE = "ekido_session"
 log = logging.getLogger(__name__)
@@ -29,6 +30,9 @@ class EmailSender(Protocol):
     def send_login_link(self, email: str, link: str) -> None:
         """Delivers a one-time sign-in link to the address."""
 
+    def send_invite(self, email: str, link: str, invite: Invite) -> None:
+        """Delivers a team invite: the same kind of one-time sign-in link, in an email that names the team and inviter."""
+
 
 class NoEmail:
     """No sender configured: sign-in links can't be delivered, so starting one fails clearly."""
@@ -36,12 +40,18 @@ class NoEmail:
     def send_login_link(self, email: str, link: str) -> None:
         raise AccountError("EMAIL_UNAVAILABLE", "Email sign-in isn't set up on this server yet.", 503)
 
+    def send_invite(self, email: str, link: str, invite: Invite) -> None:
+        raise AccountError("EMAIL_UNAVAILABLE", "Email isn't set up on this server yet, so invites can't be sent.", 503)
+
 
 class LogEmail:
     """Staging and development only: writes the link to the server log instead of sending it."""
 
     def send_login_link(self, email: str, link: str) -> None:
         log.warning("sign-in link for %s (EMAIL_SENDER=log, not for production): %s", email, link)
+
+    def send_invite(self, email: str, link: str, invite: Invite) -> None:
+        log.warning("invite to %s for %s (EMAIL_SENDER=log, not for production): %s", emails.one_line(invite.team, 80), email, link)
 
 
 class SesEmail:
@@ -55,12 +65,15 @@ class SesEmail:
         self.client, self.sender = client, sender
 
     def send_login_link(self, email: str, link: str) -> None:
+        self._send(email, SUBJECT, {"Text": {"Data": login_text(link)}})
+
+    def send_invite(self, email: str, link: str, invite: Invite) -> None:
+        body = {"Text": {"Data": emails.invite_text(invite, link)}, "Html": {"Data": emails.invite_html(invite, link)}}
+        self._send(email, emails.invite_subject(invite), body)
+
+    def _send(self, email: str, subject: str, body: dict) -> None:
         try:
-            self.client.send_email(
-                Source=self.sender,
-                Destination={"ToAddresses": [email]},
-                Message={"Subject": {"Data": SUBJECT}, "Body": {"Text": {"Data": login_text(link)}}},
-            )
+            self.client.send_email(Source=self.sender, Destination={"ToAddresses": [email]}, Message={"Subject": {"Data": subject}, "Body": body})
         except Exception as error:  # botocore errors, e.g. MessageRejected for an unverified address in the SES sandbox
             raise not_sent(error) from None
 
@@ -75,11 +88,19 @@ class SmtpEmail:
         self.host, self.port, self.user, self.password, self.sender, self.timeout = host, port, user, password, sender, timeout
 
     def send_login_link(self, email: str, link: str) -> None:
+        self._send(email, SUBJECT, login_text(link))
+
+    def send_invite(self, email: str, link: str, invite: Invite) -> None:
+        self._send(email, emails.invite_subject(invite), emails.invite_text(invite, link), emails.invite_html(invite, link))
+
+    def _send(self, email: str, subject: str, text: str, html: str | None = None) -> None:
         from email.message import EmailMessage
 
         message = EmailMessage()
-        message["From"], message["To"], message["Subject"] = self.sender, email, SUBJECT
-        message.set_content(login_text(link))
+        message["From"], message["To"], message["Subject"] = self.sender, email, subject
+        message.set_content(text)
+        if html is not None:
+            message.add_alternative(html, subtype="html")
         try:
             with self.smtp_class(self.host, self.port, timeout=self.timeout) as smtp:
                 smtp.starttls()
@@ -98,7 +119,7 @@ def login_text(link: str) -> str:
 
 def not_sent(error: Exception) -> AccountError:
     """A clear answer instead of a 500. Only the error's type is logged: never the link or the password."""
-    log.warning("sign-in email not sent: %s", error.__class__.__name__)
+    log.warning("email not sent: %s", error.__class__.__name__)
     return AccountError("EMAIL_NOT_SENT", "We couldn't send the email. Check the address, or try again in a minute.", 503)
 
 
@@ -130,7 +151,8 @@ class NewKey(Strict):
 
 
 def error(exc: AccountError) -> JSONResponse:
-    return JSONResponse({"error": exc.code, "detail": exc.detail}, status_code=exc.status)
+    headers = {"Retry-After": str(exc.extra["retry_after"])} if "retry_after" in exc.extra else None
+    return JSONResponse({**exc.extra, "error": exc.code, "detail": exc.detail}, status_code=exc.status, headers=headers)
 
 
 def build_router(engine: Engine, *, sender: EmailSender, site_url: str, allowed_origins: list[str], cookie_secure: bool = True) -> tuple[APIRouter, Callable]:
@@ -201,9 +223,12 @@ def build_router(engine: Engine, *, sender: EmailSender, site_url: str, allowed_
         accounts.require_role(session, who, org_id, "owner", "admin")
         if body.role == "owner" and accounts.role_in(session, org_id, who.user_id) != "owner":
             raise AccountError("FORBIDDEN", "Only an owner can make someone an owner.", 403)
+        # Check the email quota first, so a refused invite doesn't leave a member behind with no email sent.
+        accounts.check_link_quota(session, body.email, purpose="invite")
         user_id = accounts.add_member(session, org_id, body.email, body.role)
-        token = accounts.start_login(session, body.email)
-        sender.send_login_link(accounts.normalise_email(body.email), f"{site_url.rstrip('/')}/login/verify?token={token}")
+        token = accounts.start_login(session, body.email, purpose="invite")
+        invite = Invite(team=session.get(accounts.Org, org_id).name, inviter=accounts.inviter_label(session, who.user_id), role=body.role, site_url=site_url)
+        sender.send_invite(accounts.normalise_email(body.email), f"{site_url.rstrip('/')}/login/verify?token={token}", invite)
         return {"user_id": user_id, "invited": True}
 
     @router.delete("/orgs/{org_id}/members/{user_id}", status_code=204)

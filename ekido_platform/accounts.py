@@ -29,11 +29,12 @@ EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,253}\.[^@\s]{2,}$")
 
 
 class AccountError(ValueError):
-    """A request that can't be done. `code` is the API error code, `status` the HTTP status."""
+    """A request that can't be done. `code` is the API error code, `status` the HTTP status, and `extra` any
+    machine-readable fields the answer carries next to `error` and `detail` (for example `retry_after`)."""
 
-    def __init__(self, code: str, detail: str, status: int = 400):
+    def __init__(self, code: str, detail: str, status: int = 400, extra: dict | None = None):
         super().__init__(detail)
-        self.code, self.detail, self.status = code, detail, status
+        self.code, self.detail, self.status, self.extra = code, detail, status, extra or {}
 
 
 def _hash(token: str) -> str:
@@ -85,6 +86,9 @@ class OrgMember(Timestamped, Base):
     org_id: Mapped[str] = mapped_column(ForeignKey("orgs.id"), index=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     role: Mapped[str] = mapped_column(String(16))
+    # When the person joined: at once for the team's creator, on their next sign-in for someone invited
+    # (the invite email's link is a sign-in link). Null while the invite is pending (ekido-ai/ekido-core#104).
+    joined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ApiKey(Base):
@@ -151,13 +155,40 @@ def normalise_email(email: str) -> str:
 # ------------------------------------------------------------------ sign-in
 
 
-def start_login(session: Session, email: str, now: datetime | None = None) -> str:
+def check_link_quota(session: Session, email: str, now: datetime | None = None, purpose: str = "sign_in") -> None:
+    """Refuses when the address already had LOGIN_LINKS_PER_HOUR links in the last hour. The answer says how long to
+    wait (`retry_after`, whole seconds, and `retry_at`), and, for an invite, talks about invites rather than sign-in
+    links, since the person on the invite form never asked for a sign-in link."""
+    now = now or utcnow()
+    email = normalise_email(email)
+    window = now - timedelta(hours=1)
+    sent = session.scalars(
+        select(LoginToken.created_at).where(LoginToken.email == email, LoginToken.created_at > window).order_by(LoginToken.created_at)
+    ).all()
+    if len(sent) < LOGIN_LINKS_PER_HOUR:
+        return
+    # The oldest link in the window drops out of it first; that's when one more can go.
+    free_at = _aware(sent[len(sent) - LOGIN_LINKS_PER_HOUR]) + timedelta(hours=1)
+    wait = max(60, int((free_at - now).total_seconds() + 59) // 60 * 60)
+    minutes = wait // 60
+    when = "in a minute" if minutes == 1 else f"in {minutes} minutes"
+    extra = {"retry_after": wait, "retry_at": (now + timedelta(seconds=wait)).isoformat()}
+    if purpose == "invite":
+        raise AccountError(
+            "TOO_MANY_INVITES",
+            f"{email} has had {LOGIN_LINKS_PER_HOUR} emails from us in the last hour, so we're pausing for a bit to keep their inbox calm. "
+            f"You can send the invite again {when}.",
+            429,
+            extra,
+        )
+    raise AccountError("TOO_MANY_LINKS", f"That's a lot of sign-in links for one hour. You can ask for a new one {when}.", 429, extra)
+
+
+def start_login(session: Session, email: str, now: datetime | None = None, purpose: str = "sign_in") -> str:
     """Creates a one-time sign-in token for the address and returns it (to be emailed, never shown)."""
     now = now or utcnow()
     email = normalise_email(email)
-    recent = session.scalar(select(func.count()).select_from(LoginToken).where(LoginToken.email == email, LoginToken.created_at > now - timedelta(hours=1)))
-    if recent >= LOGIN_LINKS_PER_HOUR:
-        raise AccountError("TOO_MANY_LINKS", "Too many sign-in links for this address. Try again in an hour.", 429)
+    check_link_quota(session, email, now, purpose)
     token = secrets.token_urlsafe(32)
     session.add(LoginToken(email=email, token_hash=_hash(token), expires_at=now + LOGIN_TOKEN_TTL, created_at=now))
     session.commit()
@@ -180,6 +211,9 @@ def finish_login(session: Session, token: str, now: datetime | None = None) -> t
         session.add(address)
     user = session.get(User, address.user_id)
     address.verified_at = address.verified_at or now
+    # Signing in is how an invited person joins: every pending invite of theirs becomes a membership now.
+    for member in session.scalars(select(OrgMember).where(OrgMember.user_id == user.id, OrgMember.joined_at.is_(None))):
+        member.joined_at = now
     session_token = secrets.token_urlsafe(32)
     session.add(WebSession(user_id=user.id, token_hash=_hash(session_token), expires_at=now + SESSION_TTL, created_at=now))
     session.commit()
@@ -232,13 +266,16 @@ def create_org(session: Session, user_id: str, name: str) -> Org:
     org = Org(name=name)
     session.add(org)
     session.flush()
-    session.add(OrgMember(org_id=org.id, user_id=user_id, role="owner"))
+    session.add(OrgMember(org_id=org.id, user_id=user_id, role="owner", joined_at=utcnow()))
     session.commit()
     return org
 
 
 def add_member(session: Session, org_id: str, email: str, role: str) -> str:
-    """Adds a person by email, creating their (unverified) account if needed. Returns their user id."""
+    """Adds a person by email, creating their (unverified) account if needed. Returns their user id.
+
+    A new member is pending (`joined_at` empty) until they next sign in; inviting someone already in the team only
+    changes their role."""
     if role not in ROLES:
         raise AccountError("INVALID_ROLE", f"Role must be one of {', '.join(ROLES)}.", 422)
     email = normalise_email(email)
@@ -283,11 +320,38 @@ def me(session: Session, user_id: str) -> dict:
 
 
 def org_view(session: Session, org_id: str) -> dict:
+    """The team and its members. `status` is "joined", or "invited" while the person hasn't signed in since the
+    invite; `invited_at` and `joined_at` are ISO 8601 (or null)."""
     org = session.get(Org, org_id)
     members = session.execute(
-        select(OrgMember.user_id, UserEmail.email, OrgMember.role).join(UserEmail, UserEmail.user_id == OrgMember.user_id, isouter=True).where(OrgMember.org_id == org_id).order_by(OrgMember.created_at)
+        select(OrgMember.user_id, UserEmail.email, OrgMember.role, OrgMember.created_at, OrgMember.joined_at)
+        .join(UserEmail, UserEmail.user_id == OrgMember.user_id, isouter=True)
+        .where(OrgMember.org_id == org_id)
+        .order_by(OrgMember.created_at)
     )
-    return {"org_id": org.id, "name": org.name, "members": [{"user_id": u, "email": e, "role": r} for u, e, r in members]}
+    return {
+        "org_id": org.id,
+        "name": org.name,
+        "members": [
+            {
+                "user_id": u,
+                "email": e,
+                "role": r,
+                "status": "joined" if joined else "invited",
+                "invited_at": _aware(invited).isoformat() if invited else None,
+                "joined_at": _aware(joined).isoformat() if joined else None,
+            }
+            for u, e, r, invited, joined in members
+        ],
+    }
+
+
+def inviter_label(session: Session, user_id: str) -> str:
+    """How an invite names the person who sent it: their display name, else their email."""
+    user = session.get(User, user_id)
+    if user is not None and user.display_name:
+        return user.display_name
+    return session.scalar(select(UserEmail.email).where(UserEmail.user_id == user_id)) or "Someone on your team"
 
 
 # ------------------------------------------------------------------ API keys
