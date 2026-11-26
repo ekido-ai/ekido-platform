@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from . import accounts, emails
 from .accounts import AccountError, Principal
+from .cache import Cache
 from .emails import Invite
 
 COOKIE = "ekido_session"
@@ -155,10 +156,31 @@ def error(exc: AccountError) -> JSONResponse:
     return JSONResponse({**exc.extra, "error": exc.code, "detail": exc.detail}, status_code=exc.status, headers=headers)
 
 
-def build_router(engine: Engine, *, sender: EmailSender, site_url: str, allowed_origins: list[str], cookie_secure: bool = True) -> tuple[APIRouter, Callable]:
+def build_router(engine: Engine, *, sender: EmailSender, site_url: str, allowed_origins: list[str], cookie_secure: bool = True,
+                 cache: Cache | None = None) -> tuple[APIRouter, Callable]:
     """Returns the router and the `principal` dependency, so other /v1 routes can require a caller."""
     router = APIRouter(prefix="/v1")
     origins = set(allowed_origins)
+    cache = cache or Cache()
+
+    def key_caller(session: Session, secret: str) -> Principal | None:
+        def load() -> dict | None:
+            found = accounts.principal_for_key(session, secret)  # also records when the key was last used
+            return found and {"org_id": found.org_id, "key_id": found.key_id, "mode": found.mode, "scopes": list(found.scopes)}
+
+        known = cache.caller("key", secret, load) if secret.startswith(("ek_test_", "ek_live_")) else None
+        return known and Principal(via="api_key", org_id=known["org_id"], key_id=known["key_id"], mode=known["mode"], scopes=tuple(known["scopes"]))
+
+    def session_caller(session: Session, token: str | None) -> str | None:
+        if not token:
+            return None
+
+        def load() -> dict | None:
+            found = accounts.live_session(session, token)
+            return found and {"user_id": found[0], "expires": found[1].timestamp()}
+
+        known = cache.caller("session", token, load)
+        return known["user_id"] if known and known["expires"] > accounts.utcnow().timestamp() else None
 
     def db():
         with Session(engine) as session:
@@ -167,11 +189,11 @@ def build_router(engine: Engine, *, sender: EmailSender, site_url: str, allowed_
     def principal(request: Request, session: Session = Depends(db)) -> Principal:
         scheme, _, presented = request.headers.get("authorization", "").partition(" ")
         if scheme.lower() == "bearer" and presented.startswith("ek_"):
-            found = accounts.principal_for_key(session, presented)
+            found = key_caller(session, presented)
             if found is None:
                 raise AccountError("INVALID_KEY", "This API key is invalid or revoked.", 401)
             return found
-        user_id = accounts.user_for_session(session, request.cookies.get(COOKIE))
+        user_id = session_caller(session, request.cookies.get(COOKIE))
         if user_id is None:
             raise AccountError("SIGN_IN_REQUIRED", "Sign in, or send an API key.", 401)
         origin = request.headers.get("origin")
@@ -200,6 +222,7 @@ def build_router(engine: Engine, *, sender: EmailSender, site_url: str, allowed_
     @router.post("/auth/logout", status_code=204)
     def logout(request: Request, response: Response, session: Session = Depends(db)) -> Response:
         accounts.end_session(session, request.cookies.get(COOKIE))
+        cache.forget_callers()
         response.delete_cookie(COOKIE, path="/")
         response.status_code = 204
         return response
@@ -252,6 +275,7 @@ def build_router(engine: Engine, *, sender: EmailSender, site_url: str, allowed_
     def revoke(org_id: str, key_id: str, who: Principal = Depends(signed_in), session: Session = Depends(db)) -> Response:
         accounts.require_role(session, who, org_id, "owner", "admin")
         accounts.revoke_api_key(session, org_id, key_id)
+        cache.forget_callers()
         return Response(status_code=204)
 
     return router, principal

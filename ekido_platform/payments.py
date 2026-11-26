@@ -239,6 +239,8 @@ class RazorpayRail:
         session.commit()
         return order
 
+    cache = None  # an optional Valkey shortcut for repeated webhooks (ticket #142); the database still decides
+
     # -- 2 and 3. webhook
     def handle_webhook(self, session: Session, raw_body: bytes, signature: str | None, event_id: str | None = None) -> str:
         """Returns what happened. Raises PaymentError(BAD_SIGNATURE) for an unsigned or forged call."""
@@ -250,6 +252,8 @@ class RazorpayRail:
         except (ValueError, KeyError, TypeError):
             raise PaymentError("BAD_EVENT", "the webhook body is not a Razorpay event", 400) from None
         key = (event_id or "").strip() or "sha256:" + hashlib.sha256(raw_body).hexdigest()
+        if self.cache is not None and self.cache.webhook_seen(key):  # only after the signature check above
+            return "duplicate"
         if session.get(WebhookEvent, key) is not None:
             return "duplicate"
         entity = (((body.get("payload") or {}).get("payment") or {}).get("entity")) or {}
@@ -264,6 +268,8 @@ class RazorpayRail:
             outcome = "ignored"
         session.add(WebhookEvent(event_id=key, event=event[:60], outcome=outcome[:40]))
         session.commit()
+        if self.cache is not None:
+            self.cache.webhook_done(key)
         return outcome
 
     def _order_for(self, session: Session, gateway_order_id: str | None) -> PaymentOrder | None:

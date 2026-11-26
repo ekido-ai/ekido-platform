@@ -18,7 +18,9 @@ dependencies = [
 [project.optional-dependencies]
 # Sign-in emails through Amazon SES (EMAIL_SENDER=ses); the default "log" sender needs nothing.
 ses = ["boto3>=1.34"]
-dev = ["httpx>=0.27"]
+# Optional cache (ticket #142), needed only when VALKEY_URL is set. Valkey speaks the Redis protocol.
+valkey = ["redis>=5,<7"]
+dev = ["httpx>=0.27", "redis>=5,<7", "fakeredis[lua]>=2.26"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

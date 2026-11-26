@@ -17,6 +17,12 @@ jobs:
     name: Python (${{ matrix.suite }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      valkey:
+        image: valkey/valkey:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
     strategy:
       fail-fast: false
       matrix:
@@ -32,12 +38,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "sqlalchemy>=2" "fastapi>=0.115" httpx "fpdf2>=2.8,<3" pydantic-settings websockets "uvicorn>=0.30" eth-account web3 "pyyaml==6.0.2" "ekido-core @ git+https://github.com/ekido-ai/ekido-core@v0.4.4#subdirectory=packages/ekido_core"
+          pip install "sqlalchemy>=2" "fastapi>=0.115" httpx "fpdf2>=2.8,<3" pydantic-settings websockets "uvicorn>=0.30" eth-account web3 "pyyaml==6.0.2" "redis==6.4.0" "fakeredis[lua]==2.41.0" "ekido-core @ git+https://github.com/ekido-ai/ekido-core@v0.4.4#subdirectory=packages/ekido_core"
       - name: Run tests
         working-directory: ${{ matrix.dir }}
         env:
           PYTHONPATH: ${{ matrix.path }}
           PYTHONDONTWRITEBYTECODE: "1"
+          TEST_VALKEY_URL: redis://127.0.0.1:6379/0  # the cache tests also run against a real Valkey
         run: python -m unittest discover -s tests
 
   postgres:
