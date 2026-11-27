@@ -9,12 +9,16 @@ A job is the team's if the Platform started it from the team's paid order (`job_
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
@@ -36,6 +40,13 @@ STAGES = {
     "SETTLED": "passed", "REFUNDED": "refunded", "FAILED": "refunded", "CANCELLED": "cancelled",
 }
 MODEL_READY = {"COMPLETED", "SETTLED"}
+DONE_STAGES = {"passed", "refunded", "cancelled"}
+# The live stream (ticket #156). The close codes tell the page whether trying again makes sense.
+LIVE_INTERVAL = 5.0  # seconds between looks at the Coordinator, the same as the page's old polling
+LIVE_MAX_SECONDS = 1800  # then closed; the page connects again, which checks the sign-in again from the start
+LIVE_PER_PERSON = 5
+CLOSE_DONE, CLOSE_BAD_ORIGIN, CLOSE_SIGN_IN, CLOSE_NOT_FOUND, CLOSE_TOO_MANY = 1000, 1008, 4401, 4404, 4429
+SESSION_COOKIE = "ekido_session"
 
 
 def customer_view(job: dict, events: list[dict], order: PaymentOrder | None) -> dict[str, Any]:
@@ -78,8 +89,12 @@ def customer_view(job: dict, events: list[dict], order: PaymentOrder | None) -> 
 
 
 def build_customer_jobs_router(engine: Engine, principal: Callable, coordinator: Callable[[], CoordinatorCall],
-                               coordinator_url: Callable[[], tuple[str, str]]) -> APIRouter:
+                               coordinator_url: Callable[[], tuple[str, str]], *, allowed_origins: list[str] | None = None,
+                               live_interval: Callable[[], float] = lambda: LIVE_INTERVAL) -> APIRouter:
     router = APIRouter(prefix="/v1")
+    origins = set(allowed_origins or [])
+    watching: dict[str, int] = {}
+    watching_lock = threading.Lock()
 
     def db():
         with Session(engine) as session:
@@ -126,6 +141,88 @@ def build_customer_jobs_router(engine: Engine, principal: Callable, coordinator:
     def one_job(job_id: str, who: Principal = Depends(principal), session: Session = Depends(db)) -> dict[str, Any]:
         own(session, who, job_id)
         return view(session, job_id)
+
+    def watcher(token: str | None, job_id: str) -> str:
+        """The signed-in person, if they may see this job right now. Raises AccountError otherwise."""
+        with Session(engine) as session:
+            user_id = accounts.user_for_session(session, token)
+            if user_id is None:
+                raise AccountError("SIGN_IN_REQUIRED", "Sign in.", 401)
+            own(session, Principal(via="session", user_id=user_id), job_id)
+            return user_id
+
+    def look(job_id: str) -> dict[str, Any]:
+        with Session(engine) as session:
+            return view(session, job_id)
+
+    def close_code(exc: AccountError) -> int:
+        return CLOSE_SIGN_IN if exc.status == 401 else CLOSE_NOT_FOUND  # another team's job looks missing here too
+
+    async def wait(socket: WebSocket, seconds: float) -> bool:
+        """Sleep, but notice at once if the page goes away. Whatever the page sends is read and ignored. False: it left."""
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                message = await asyncio.wait_for(socket.receive(), left)
+            except asyncio.TimeoutError:
+                break
+            if message["type"] == "websocket.disconnect":
+                return False
+        return True
+
+    @router.websocket("/jobs/{job_id}/live")
+    async def live(socket: WebSocket, job_id: str) -> None:
+        """The same allow-listed view as `GET /v1/jobs/{id}`, sent when it changes. Session cookie only.
+
+        A browser sends the cookie with a WebSocket from any site and CORS does not apply, so the Origin must be one of ours."""
+        if socket.headers.get("origin") not in origins:
+            await socket.close(CLOSE_BAD_ORIGIN)
+            return
+        token = socket.cookies.get(SESSION_COOKIE)
+        await socket.accept()  # accepted first, so the page can read why it is closed
+        try:
+            user_id = await run_in_threadpool(watcher, token, job_id)
+        except AccountError as exc:
+            await socket.close(close_code(exc))
+            return
+        with watching_lock:
+            if watching.get(user_id, 0) >= LIVE_PER_PERSON:
+                over = True
+            else:
+                over, watching[user_id] = False, watching.get(user_id, 0) + 1
+        if over:
+            await socket.close(CLOSE_TOO_MANY)
+            return
+        try:
+            sent, ends = None, time.monotonic() + LIVE_MAX_SECONDS
+            while time.monotonic() < ends:
+                try:
+                    await run_in_threadpool(watcher, token, job_id)  # every time: a sign-out or a removal ends the stream
+                except AccountError as exc:
+                    await socket.close(close_code(exc))
+                    return
+                try:
+                    message = {"type": "job", "job": await run_in_threadpool(look, job_id)}
+                except AccountError as exc:
+                    if exc.status == 404:
+                        await socket.close(CLOSE_NOT_FOUND)
+                        return
+                    message = {"type": "unavailable"}  # never the Coordinator's own words
+                if message != sent:
+                    await socket.send_json(message)
+                    sent = message
+                if message.get("job", {}).get("stage") in DONE_STAGES:
+                    break
+                if not await wait(socket, live_interval()):
+                    return
+            await socket.close(CLOSE_DONE)
+        except (WebSocketDisconnect, RuntimeError):
+            pass  # the page went away while we were sending
+        finally:
+            with watching_lock:
+                watching[user_id] -= 1
+                if not watching[user_id]:
+                    del watching[user_id]
 
     @router.get("/orgs/{org_id}/models", tags=["models"])
     def team_models(org_id: str, who: Principal = Depends(principal), session: Session = Depends(db)) -> list[dict[str, Any]]:
