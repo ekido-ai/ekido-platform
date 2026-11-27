@@ -171,6 +171,18 @@ class RateLimit:
             return True
 
 
+class SharedRateLimit(RateLimit):
+    """The same limit, counted in Valkey so every process shares it. Without Valkey it is the in-process limit (ticket #142)."""
+
+    def __init__(self, cache, limit: int = RATE_LIMIT, window: int = RATE_WINDOW):
+        super().__init__(limit, window)
+        self.cache = cache
+
+    def allow(self, subject: str, now: float | None = None) -> bool:
+        shared = self.cache.allow("assistant", subject, self.limit, self.window)
+        return super().allow(subject, now) if shared is None else shared
+
+
 class RefusalBreaker:
     """After `limit` refused requests from one person within `window` seconds, stop answering them for the rest of the window, so the
     screening models cannot be probed over and over. In this process, like RateLimit."""
@@ -202,6 +214,22 @@ class RefusalBreaker:
             times = self._recent(subject, now)
             times.append(now)
             self.refused[subject] = times
+
+
+class SharedRefusalBreaker(RefusalBreaker):
+    """The breaker counted in Valkey. Refusals are also kept in the process, so an outage does not forget them."""
+
+    def __init__(self, cache, limit: int = 5, window: int = 3600):
+        super().__init__(limit, window)
+        self.cache = cache
+
+    def open(self, subject: str, now: float | None = None) -> bool:
+        shared = self.cache.count("refusal", subject, self.window)
+        return super().open(subject, now) if shared is None else shared >= self.limit or super().open(subject, now)
+
+    def record(self, subject: str, now: float | None = None) -> None:
+        super().record(subject, now)
+        self.cache.allow("refusal", subject, self.limit, self.window)
 
 
 def build_assistant_router(engine: Engine, principal: Callable, engine_url: str, state_secret: str, *,

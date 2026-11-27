@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     invoice_test_mode: bool = True
     # Shared secret for the Coordinator-only routes under /internal (erasure tasks, settle and refund). Empty keeps them closed (404).
     internal_token: str = ""
+    # Optional Valkey (or Redis) on this machine, for example redis://127.0.0.1:6379/0 (ticket #142). Empty: no cache. Never the
+    # source of truth: if it is down, everything still works from Postgres.
+    valkey_url: str = ""
 
 
 def create_engine_for(database_url: str) -> Engine:
@@ -103,7 +106,10 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
         sender = SmtpEmail(settings.smtp_host, settings.smtp_port, settings.smtp_user, settings.smtp_password, settings.email_from)
     else:
         sender = {"log": LogEmail}.get(settings.email_sender, NoEmail)()
-    router, principal = build_router(engine, sender=sender, site_url=settings.site_url, allowed_origins=settings.cors_origins, cookie_secure=settings.session_cookie_secure)
+    from .cache import Cache
+
+    cache = app.state.cache = Cache.from_url(settings.valkey_url)
+    router, principal = build_router(engine, sender=sender, site_url=settings.site_url, allowed_origins=settings.cors_origins, cookie_secure=settings.session_cookie_secure, cache=cache)
     app.include_router(router)
     app.state.principal = principal
 
@@ -116,17 +122,19 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
                                                    v1_admin.coordinator_client(settings.coordinator_url, settings.coordinator_token),
                                                    payment_rail=lambda: getattr(app.state, "payment_rail", None)))
 
-    from .v1_assistant import RateLimit, RefusalBreaker, build_assistant_router
+    from .v1_assistant import SharedRateLimit, SharedRefusalBreaker, build_assistant_router
     app.include_router(build_assistant_router(engine, principal, settings.assistant_engine_url,
         settings.assistant_state_secret, guard_url=settings.assistant_guard_url, transport=assistant_transport,
-        limiter=RateLimit(settings.assistant_rate_limit, settings.assistant_rate_window),
-        breaker=RefusalBreaker(settings.assistant_refusal_limit)))
+        limiter=SharedRateLimit(cache, settings.assistant_rate_limit, settings.assistant_rate_window),
+        breaker=SharedRefusalBreaker(cache, settings.assistant_refusal_limit)))
 
     from .payments import RazorpayHttpGateway, RazorpayRail
     from .v1_payments import build_payments_router
     rail = None
     if settings.razorpay_key_id and settings.razorpay_key_secret and settings.razorpay_webhook_secret:
         rail = RazorpayRail(RazorpayHttpGateway(settings.razorpay_key_id, settings.razorpay_key_secret), settings.razorpay_webhook_secret)
+    if rail is not None:
+        rail.cache = cache
     app.state.payment_rail = rail
     app.state.plans = None
     if rail is not None and settings.razorpay_plan_starter and settings.razorpay_plan_business:
@@ -188,7 +196,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None, *
         session.execute(delete(plans.PlanUsage).where(plans.PlanUsage.org_id == org_id))
         session.execute(delete(plans.TeamPlan).where(plans.TeamPlan.org_id == org_id))
 
-    app.include_router(build_privacy_router(engine, principal, exporters={"payments": export_payments, "plans": export_plans}, org_erasers=[erase_plans, v1_distill.erase_distillations],
+    app.include_router(build_privacy_router(engine, principal, on_erased=cache.forget_callers, exporters={"payments": export_payments, "plans": export_plans}, org_erasers=[erase_plans, v1_distill.erase_distillations],
                                             job_checks=[privacy.refuse_while_jobs_run(lambda: app.state.coordinator_get)]))
     @app.exception_handler(AccountError)
     async def account_refused(_: Request, exc: AccountError):

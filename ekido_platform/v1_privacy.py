@@ -24,7 +24,8 @@ class ConsentBody(BaseModel):
     policy_version: str = ""
 
 
-def build_privacy_router(engine: Engine, principal: Callable, *, exporters: dict | None = None, org_erasers: list | None = None, job_checks: list | None = None) -> APIRouter:
+def build_privacy_router(engine: Engine, principal: Callable, *, exporters: dict | None = None, org_erasers: list | None = None, job_checks: list | None = None,
+                         on_erased: Callable | None = None) -> APIRouter:
     router = APIRouter(prefix="/v1")
 
     def db():
@@ -52,6 +53,8 @@ def build_privacy_router(engine: Engine, principal: Callable, *, exporters: dict
     @router.delete("/me", status_code=202)
     def delete_me(request: Request, who: Principal = Depends(signed_in), session: Session = Depends(db)) -> JSONResponse:
         request_row = privacy.request_deletion(session, who.user_id, org_erasers, job_checks=job_checks)
+        if on_erased is not None:
+            on_erased()  # the deleted person's sessions and keys must stop working now, not when a cache entry expires
         response = JSONResponse({"status": request_row.status, "due_by": privacy._iso(request_row.due_at)}, status_code=202)
         response.delete_cookie(COOKIE, path="/")  # every session of theirs is already gone
         return response

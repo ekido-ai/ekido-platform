@@ -220,14 +220,20 @@ def finish_login(session: Session, token: str, now: datetime | None = None) -> t
     return user, session_token
 
 
-def user_for_session(session: Session, token: str | None, now: datetime | None = None) -> str | None:
+def live_session(session: Session, token: str | None, now: datetime | None = None) -> tuple[str, datetime] | None:
+    """(user id, expiry) of a session that is neither revoked nor expired."""
     if not token:
         return None
     now = now or utcnow()
     row = session.scalar(select(WebSession).where(WebSession.token_hash == _hash(token)))
     if row is None or row.revoked_at is not None or _aware(row.expires_at) <= now:
         return None
-    return row.user_id
+    return row.user_id, _aware(row.expires_at)
+
+
+def user_for_session(session: Session, token: str | None, now: datetime | None = None) -> str | None:
+    found = live_session(session, token, now)
+    return found[0] if found else None
 
 
 def end_session(session: Session, token: str | None) -> None:
