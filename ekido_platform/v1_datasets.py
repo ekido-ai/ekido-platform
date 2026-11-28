@@ -15,12 +15,16 @@ A team sees only its own datasets and quotes; anything else looks missing (404),
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import threading
+import time
 import uuid
+from collections import OrderedDict, deque
 from datetime import datetime
 from typing import Any, Callable
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import JSON, DateTime, ForeignKey, Integer, LargeBinary, String, select
 from sqlalchemy.engine import Engine
@@ -87,6 +91,73 @@ def recipe_view(r) -> dict[str, Any]:
     source, target = r.columns
     return {"recipe_id": r.recipe_id, "title": r.title, "task": r.task, "columns": {"input": source, "answer": target},
             "labels": list(r.labels), "metric": r.metric, "floor": r.floor, "quality_terms": r.plain_words(100).replace("100 ", "")}
+
+
+# An estimate asks for no sign-in, so it is cheap and answers every caller the same: it prices two row counts, stores nothing and signs
+# nothing. It names only what a customer is shown on a real quote's face; the fee split and the provider budget stay out.
+ESTIMATE_FIELDS = ("currency", "training_paise", "gst_paise", "total_paise", "eta_minutes", "quality_terms", "refund_policy", "prices_provisional")
+ESTIMATE_LIMIT, ESTIMATE_WINDOW = 60, 600  # requests per address per ten minutes
+
+
+def bucket_of(address: str) -> str:
+    """What the limit counts. An IPv6 address counts as its /64 (one customer or attacker usually owns the whole /64, so rotating through
+    it must not give a fresh allowance each time); an IPv4 address, or anything that does not parse, counts as itself."""
+    try:
+        ip = ipaddress.ip_address(address.split("%")[0])
+    except ValueError:
+        return address[:64]
+    if ip.version == 6:
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return str(ip)
+
+
+def client_address(request: Request) -> str:
+    """The caller's address, as a limit bucket. The Platform listens on loopback behind Caddy, which sets X-Forwarded-For to the real
+    address, so the header is believed only when the connection itself comes from loopback; a direct caller cannot choose its own bucket."""
+    peer = request.client.host if request.client else "unknown"
+    if peer in ("127.0.0.1", "::1"):
+        forwarded = request.headers.get("x-forwarded-for", "")
+        last = forwarded.split(",")[-1].strip()
+        if last:
+            return bucket_of(last)
+    return bucket_of(peer)
+
+
+class EstimateLimiter:
+    """At most `limit` estimates per bucket per `window` seconds, in this process. The table is bounded, and when it is full the
+    bucket seen longest ago is dropped to make room: a new visitor is never refused because other addresses filled the table (a route
+    that needs no sign-in must not be switched off for everyone by one person with many addresses)."""
+
+    def __init__(self, limit: int = 60, window: int = 600, max_buckets: int = 10_000):
+        self.limit, self.window, self.max_buckets = limit, window, max_buckets
+        self.seen: OrderedDict[str, deque] = OrderedDict()
+        self.lock = threading.Lock()
+
+    def allow(self, bucket: str, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            times = self.seen.get(bucket)
+            if times is None:
+                while len(self.seen) >= self.max_buckets:
+                    self.seen.popitem(last=False)
+                times = self.seen[bucket] = deque()
+            else:
+                self.seen.move_to_end(bucket)
+            while times and now - times[0] > self.window:
+                times.popleft()
+            if len(times) >= self.limit:
+                return False
+            times.append(now)
+            return True
+
+
+def estimate_view(recipe_id: str, train_rows: int, test_rows: int, distill: bool = False) -> dict[str, Any]:
+    """What a quote would roughly cost for this many examples, for a visitor who has not signed in. Raises QuoteError for a bad count.
+    With `distill`, the price includes the generated examples that a short training set is topped up with, as a real quote does."""
+    quote = make_quote(recipe_id=recipe_id, base_model=LLM_BASES[0], train_rows=train_rows, test_rows=test_rows, dataset_sha256="0" * 64,
+                       distill=distill)
+    return {"recipe_id": recipe_id, "train_rows": train_rows, "test_rows": test_rows, "estimate": True, "distill": distill,
+            "generated_rows": quote["plan"]["generated_rows"], **{field: quote[field] for field in ESTIMATE_FIELDS}}
 
 
 def row_problems(recipe_id: str, train: list[dict], test: list[dict]) -> list[str]:
@@ -190,6 +261,22 @@ def build_datasets_router(engine: Engine, principal: Callable, payment_rail: Cal
         if recipe_id not in RECIPES:
             raise AccountError("NOT_FOUND", "No such recipe.", 404)
         return recipe_view(RECIPES[recipe_id])
+
+    estimate_limiter = EstimateLimiter(ESTIMATE_LIMIT, ESTIMATE_WINDOW)
+
+    @router.get("/recipes/{recipe_id}/estimate", tags=["recipes"])
+    def recipe_estimate(recipe_id: str, request: Request, train_rows: int = Query(ge=1, le=MAX_TRAIN_ROWS),
+                        test_rows: int = Query(ge=MIN_TEST_ROWS, le=MAX_TEST_ROWS), distill: bool = False) -> dict[str, Any]:
+        """A rough price and the quality terms for a recipe, before anyone signs in. Not a quote: nothing is stored, signed or reserved,
+        and the real price is the quote made after the examples are uploaded."""
+        if recipe_id not in RECIPES:
+            raise AccountError("NOT_FOUND", "No such recipe.", 404)
+        if not estimate_limiter.allow(client_address(request)):
+            raise AccountError("RATE_LIMITED", "Too many price estimates. Try again in a few minutes.", 429)
+        try:
+            return estimate_view(recipe_id, train_rows, test_rows, distill)
+        except QuoteError as exc:
+            raise AccountError("ESTIMATE_REFUSED", str(exc), 422) from None
 
     @router.post("/orgs/{org_id}/datasets", status_code=201, tags=["recipes"])
     def new_dataset(org_id: str, body: NewDataset, who: Principal = Depends(principal), session: Session = Depends(db)) -> dict[str, Any]:
